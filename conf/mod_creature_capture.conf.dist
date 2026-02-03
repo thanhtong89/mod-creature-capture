@@ -1,0 +1,43 @@
+[worldserver]
+
+###################################################################################################
+#   MOD-CREATURE-CAPTURE
+#   Capture NPCs and turn them into guardian companions
+###################################################################################################
+
+# Enable the module
+# Default: 1 (enabled)
+CreatureCapture.Enable = 1
+
+# Announce module to players on login
+# Default: 1 (enabled)
+CreatureCapture.Announce = 1
+
+# Guardian duration in seconds (0 = permanent until dismissed or death)
+# Default: 0
+CreatureCapture.GuardianDuration = 0
+
+# Allow capturing elite creatures
+# Default: 0 (disabled)
+CreatureCapture.AllowElite = 0
+
+# Allow capturing rare creatures
+# Default: 1 (enabled)
+CreatureCapture.AllowRare = 1
+
+# Maximum level difference (player level - creature level)
+# Creatures higher level than player + this value cannot be captured
+# Default: 5
+CreatureCapture.MaxLevelDiff = 5
+
+# Minimum creature level that can be captured
+# Default: 1
+CreatureCapture.MinCreatureLevel = 1
+
+# Guardian health percentage of original creature
+# Default: 100
+CreatureCapture.HealthPct = 100
+
+# Guardian damage percentage of original creature
+# Default: 100
+CreatureCapture.DamagePct = 100
