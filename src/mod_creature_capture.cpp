@@ -171,6 +171,19 @@ public:
                             return;
                         }
                     }
+
+					if (!me->GetVictim())
+					{
+						for (Unit* attacker : me->getAttackers())
+						{
+							if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+							{
+								me->AddThreat(attacker, 100.0f);
+								AttackStart(attacker);
+								return; // Target found, stop looking
+							}
+						}
+					}
                 }
             }
 
@@ -193,23 +206,6 @@ public:
         }
     }
 
-    void OwnerAttackedBy(Unit* attacker) override
-    {
-        if (!me->GetVictim() && attacker && me->CanCreatureAttack(attacker))
-        {
-            AttackStart(attacker);
-        }
-    }
-
-    void AttackedBy(Unit* attacker) override
-    {
-        // Retaliate when attacked directly
-        if (!me->GetVictim() && attacker && me->CanCreatureAttack(attacker))
-        {
-            AttackStart(attacker);
-        }
-    }
-
     void EnterEvadeMode(EvadeReason /*why*/) override
     {
         // Don't evade, just return to owner
@@ -219,16 +215,20 @@ public:
             me->GetMotionMaster()->MoveFollow(_owner, GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
     }
 
-    void KilledUnit(Unit* victim) override
+    // Use this hook inside your Guardian's AI:
+    void DamageDealt(Unit* victim, uint32& /*damage*/, DamageEffectType /*damageType*/, SpellSchoolMask /*damageSchoolMask*/) override
     {
-        // Give loot rights to the owner when guardian kills something
-        if (_owner && victim && victim->IsCreature())
+        if (victim && victim->IsCreature() && _owner)
         {
-            Creature* killed = victim->ToCreature();
-            // Set loot recipient to owner so they can loot
-            killed->SetLootRecipient(_owner);
-            // Mark as damaged by player so loot is generated
-            killed->LowerPlayerDamageReq(killed->GetMaxHealth(), true);
+            Creature* target = victim->ToCreature();
+
+            // This is the "Magic Bullet" for AzerothCore loot:
+            // We force the victim to think the owner has already dealt damage to it.
+            target->SetLootRecipient(_owner);
+
+            // This ensures that even if the guardian does 100% of the damage,
+            // the "Player Damage Required" is satisfied.
+            target->LowerPlayerDamageReq(target->GetHealth());
         }
     }
 
@@ -329,15 +329,31 @@ private:
 
             // Add cooldown - use spell's recovery time or category cooldown
             uint32 cooldown = spellInfo->RecoveryTime;
-            if (cooldown == 0)
-                cooldown = spellInfo->CategoryRecoveryTime;
-
-            // Only force cooldowns for heals/buffs to prevent spam
-            // Regular offensive spells cast naturally via GCD/cast time
-            if (isHealingSpell && cooldown < 15000)
-                cooldown = 15000; // Min 15s for heals
+            if (isHealingSpell && cooldown < 10000)
+                cooldown = 10000; // Min 10s for heals
             else if (isBuffSpell && cooldown < 30000)
                 cooldown = 30000; // Min 30s for buffs
+			else if (cooldown == 0)
+			{
+				if (spellInfo->CategoryRecoveryTime > cooldown)
+					cooldown = spellInfo->CategoryRecoveryTime;
+				if (spellInfo->StartRecoveryTime > cooldown)
+					cooldown = spellInfo->StartRecoveryTime;
+
+				// 2. ENFORCE GLOBAL MINIMUM
+				// If the spell is still 0 (very common for NPC spells),
+				// force a default 5-10 second cooldown so they don't spam it.
+				if (cooldown == 0)
+				{
+					cooldown = 2000;
+				}
+
+				// 3. Add a small "Variance" (Optional but makes it feel real)
+				// This prevents the guardian from casting exactly every 8.000 seconds.
+				cooldown += urand(500, 1500);
+			}
+            // force cooldowns for heals/buffs to prevent spam
+            // Regular offensive spells cast naturally via GCD/cast time
 
             if (cooldown > 0)
                 me->AddSpellCooldown(spellId, 0, cooldown);
@@ -515,6 +531,11 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->SetFaction(player->GetFaction());
     guardian->SetLevel(level);
 
+    // Clear immunity flags that prevent combat
+    guardian->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_ATTACKABLE_1);
+    // Force Faction to match player
+    guardian->SetFaction(player->GetFaction());
+
     // Set flags for player control
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
 
@@ -610,7 +631,7 @@ public:
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
         data->guardianGuid = guardian->GetGUID();
 
-        handler->PSendSysMessage("You have captured {} (Level {})! It will now follow and protect you.",
+        handler->PSendSysMessage("You have captured {} (Level {})! It will now follow and protect you!",
             name, level);
 
         return true;
