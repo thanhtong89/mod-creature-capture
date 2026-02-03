@@ -11,6 +11,7 @@
 #include "Config.h"
 #include "Creature.h"
 #include "CreatureAI.h"
+#include "CreatureAISelector.h"
 #include "DataMap.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -22,6 +23,10 @@
 #include "SpellMgr.h"
 #include "TemporarySummon.h"
 #include "Unit.h"
+
+#include <algorithm>
+#include <typeinfo>
+#include <vector>
 
 // Constants
 constexpr float GUARDIAN_FOLLOW_DIST = 3.0f;
@@ -42,13 +47,15 @@ public:
 /*
  * CapturedGuardianAI
  *
- * Custom AI for captured guardians. Simpler than PetAI since we don't need
- * the control bar - just follow and protect behavior.
+ * Wrapper AI that preserves the creature's original combat behavior (SmartAI,
+ * scripted AI, etc.) while adding follow/protect logic for the player owner.
  */
 class CapturedGuardianAI : public CreatureAI
 {
 public:
-    explicit CapturedGuardianAI(Creature* creature) : CreatureAI(creature),
+    explicit CapturedGuardianAI(Creature* creature, CreatureAI* originalAI = nullptr)
+        : CreatureAI(creature),
+        _originalAI(originalAI),
         _owner(nullptr),
         _updateTimer(1000),
         _combatCheckTimer(500),
@@ -59,6 +66,20 @@ public:
         {
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
         }
+
+        // DEBUG: Log what AI we're wrapping
+        if (_owner)
+        {
+            if (_originalAI)
+                ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Guardian AI wrapping original AI: {}", typeid(*_originalAI).name());
+            else
+                ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Guardian AI has no original AI to wrap (using fallback spell logic)");
+        }
+    }
+
+    ~CapturedGuardianAI()
+    {
+        delete _originalAI;
     }
 
     void UpdateAI(uint32 diff) override
@@ -108,11 +129,17 @@ public:
                 return;
             }
 
-            // Do melee attack
-            DoMeleeAttackIfReady();
-
-            // Try to cast spells
-            DoCastSpells();
+            // DELEGATE COMBAT TO ORIGINAL AI if available
+            if (_originalAI)
+            {
+                _originalAI->UpdateAI(diff);
+            }
+            else
+            {
+                // Fallback: basic melee + our spell logic
+                DoMeleeAttackIfReady();
+                DoCastSpells();
+            }
         }
         else
         {
@@ -172,18 +199,18 @@ public:
                         }
                     }
 
-					if (!me->GetVictim())
-					{
-						for (Unit* attacker : me->getAttackers())
-						{
-							if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
-							{
-								me->AddThreat(attacker, 100.0f);
-								AttackStart(attacker);
-								return; // Target found, stop looking
-							}
-						}
-					}
+                    if (!me->GetVictim())
+                    {
+                        for (Unit* attacker : me->getAttackers())
+                        {
+                            if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                            {
+                                me->AddThreat(attacker, 100.0f);
+                                AttackStart(attacker);
+                                return; // Target found, stop looking
+                            }
+                        }
+                    }
                 }
             }
 
@@ -193,6 +220,102 @@ public:
                 me->GetMotionMaster()->MoveFollow(_owner, GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
             }
         }
+
+        // Periodically check summoned creatures - stop them from attacking the owner
+        _summonCheckTimer -= diff;
+        if (_summonCheckTimer <= 0 && _owner && !_summonedGuids.empty())
+        {
+            _summonCheckTimer = 500; // Check twice per second
+
+            // Check each tracked summon
+            for (auto it = _summonedGuids.begin(); it != _summonedGuids.end(); )
+            {
+                Creature* summon = ObjectAccessor::GetCreature(*me, *it);
+
+                // Remove dead/despawned/invalid summons from tracking
+                if (!summon || !summon->IsAlive() || !summon->IsInWorld())
+                {
+                    it = _summonedGuids.erase(it);
+                    continue;
+                }
+
+                // If it's targeting the owner, stop it!
+                if (summon->GetVictim() == _owner)
+                {
+                    summon->GetThreatMgr().ClearAllThreat();
+                    summon->AttackStop();
+                    summon->SetFaction(_owner->GetFaction());
+
+                    // Redirect to guardian's target if we have one (with null checks)
+                    if (Unit* myVictim = me->GetVictim())
+                    {
+                        if (CreatureAI* ai = summon->AI())
+                            ai->AttackStart(myVictim);
+                    }
+                }
+
+                ++it;
+            }
+        }
+    }
+
+
+    void JustSummoned(Creature* summon) override
+    {
+        if (!summon || !_owner)
+            return;
+
+        if (_owner)
+            ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] JustSummoned called for: {} (entry {})",
+                summon->GetName(), summon->GetEntry());
+
+        // 1. Set owner to the player (not the guardian) so it's treated as player's minion
+        summon->SetOwnerGUID(_owner->GetGUID());
+        summon->SetCreatorGUID(_owner->GetGUID());
+
+        // 2. Force faction to match player
+        summon->SetFaction(_owner->GetFaction());
+
+        // 3. Clear any hostile flags and mark as player-controlled
+        summon->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_PC);
+        summon->SetImmuneToPC(false);
+        summon->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
+
+        // 4. Clear all threat so it doesn't attack the player
+        summon->GetThreatMgr().ClearAllThreat();
+
+        // 5. Set to defensive react state
+        summon->SetReactState(REACT_DEFENSIVE);
+
+        // 6. Make it attack what the guardian is attacking
+        if (Unit* victim = me->GetVictim())
+        {
+            summon->AI()->AttackStart(victim);
+        }
+
+        // Delegate to original AI (but our setup takes priority)
+        if (_originalAI)
+            _originalAI->JustSummoned(summon);
+
+        // Re-apply faction after delegation in case original AI changed it
+        summon->SetFaction(_owner->GetFaction());
+
+        // Track this summon so we can check it periodically
+        _summonedGuids.push_back(summon->GetGUID());
+    }
+
+    void SummonedCreatureDespawn(Creature* summon) override
+    {
+        // Remove from our tracking list
+        if (summon)
+        {
+            auto it = std::find(_summonedGuids.begin(), _summonedGuids.end(), summon->GetGUID());
+            if (it != _summonedGuids.end())
+                _summonedGuids.erase(it);
+        }
+
+        if (_originalAI)
+            _originalAI->SummonedCreatureDespawn(summon);
     }
 
     void AttackStart(Unit* target) override
@@ -200,19 +323,74 @@ public:
         if (!target || !me->CanCreatureAttack(target))
             return;
 
-        if (me->Attack(target, true))
+        // Ensure we enter combat state - this is required for SmartAI events to fire
+        if (!me->IsInCombat())
         {
-            me->GetMotionMaster()->MoveChase(target);
+            me->SetInCombatWith(target);
+            target->SetInCombatWith(me);
+        }
+
+        // Delegate to original AI if available
+        if (_originalAI)
+        {
+            _originalAI->AttackStart(target);
+        }
+        else
+        {
+            if (me->Attack(target, true))
+            {
+                me->GetMotionMaster()->MoveChase(target);
+            }
         }
     }
 
-    void EnterEvadeMode(EvadeReason /*why*/) override
+    void EnterEvadeMode(EvadeReason why) override
     {
-        // Don't evade, just return to owner
+        // Don't evade normally - just return to owner
+        // But still notify original AI so it can reset internal state
+        if (_originalAI)
+            _originalAI->EnterEvadeMode(why);
+
         me->AttackStop();
         me->GetMotionMaster()->Clear();
         if (_owner)
             me->GetMotionMaster()->MoveFollow(_owner, GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
+    }
+
+    void JustEngagedWith(Unit* who) override
+    {
+        if (_owner)
+            ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] JustEngagedWith called, target: {}", who ? who->GetName() : "(null)");
+
+        if (_originalAI)
+            _originalAI->JustEngagedWith(who);
+    }
+
+    void KilledUnit(Unit* victim) override
+    {
+        // Give loot rights to owner
+        if (_owner && victim && victim->IsCreature())
+        {
+            Creature* killed = victim->ToCreature();
+            killed->SetLootRecipient(_owner);
+            killed->LowerPlayerDamageReq(killed->GetMaxHealth());
+        }
+
+        // Notify original AI
+        if (_originalAI)
+            _originalAI->KilledUnit(victim);
+    }
+
+    void SpellHit(Unit* caster, SpellInfo const* spellInfo) override
+    {
+        if (_originalAI)
+            _originalAI->SpellHit(caster, spellInfo);
+    }
+
+    void DamageTaken(Unit* attacker, uint32& damage, DamageEffectType damageType, SpellSchoolMask schoolMask) override
+    {
+        if (_originalAI)
+            _originalAI->DamageTaken(attacker, damage, damageType, schoolMask);
     }
 
     // Use this hook inside your Guardian's AI:
@@ -232,13 +410,17 @@ public:
         }
     }
 
-    void JustDied(Unit* /*killer*/) override
+    void JustDied(Unit* killer) override
     {
         // Notify owner
         if (_owner)
         {
             ChatHandler(_owner->GetSession()).PSendSysMessage("Your captured guardian has died.");
         }
+
+        // Delegate to original AI for cleanup
+        if (_originalAI)
+            _originalAI->JustDied(killer);
     }
 
 private:
@@ -270,7 +452,12 @@ private:
 
             // Check cooldown
             if (me->HasSpellCooldown(spellId))
+            {
+                // DEBUG: show when spell is skipped due to cooldown
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - ON COOLDOWN, skipping", i, spellId);
                 continue;
+            }
 
             // Check if spell can be used in combat
             if (!spellInfo->CanBeUsedInCombat())
@@ -288,32 +475,54 @@ private:
             {
                 // Only cast healing spells when health is below 40%
                 if (me->GetHealthPct() > 40.0f)
+                {
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - HEAL skipped (HP {}% > 40%)", i, spellId, static_cast<int>(me->GetHealthPct()));
                     continue;
+                }
 
                 // Cast on self
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING HEAL on self", i, spellId);
                 me->CastSpell(me, spellId, false);
             }
             else if (isBuffSpell)
             {
                 // Check if we already have this buff
                 if (me->HasAura(spellId))
+                {
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - BUFF skipped (already have aura)", i, spellId);
                     continue;
+                }
 
                 // Cast on self
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING BUFF on self", i, spellId);
                 me->CastSpell(me, spellId, false);
             }
             else if (isPeriodicSpell)
             {
                 // Don't reapply DoTs if target already has them
                 if (target->HasAura(spellId, me->GetGUID()))
+                {
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - DOT skipped (target has aura)", i, spellId);
                     continue;
+                }
 
                 // Check range
                 if (spellInfo->GetMaxRange(false) > 0 &&
                     !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                {
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - DOT skipped (out of range)", i, spellId);
                     continue;
+                }
 
                 // Cast on target
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING DOT on target", i, spellId);
                 me->CastSpell(target, spellId, false);
             }
             else
@@ -321,9 +530,15 @@ private:
                 // Regular offensive spell - check range
                 if (spellInfo->GetMaxRange(false) > 0 &&
                     !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                {
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - OFFENSIVE skipped (out of range)", i, spellId);
                     continue;
+                }
 
                 // Cast on target
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING OFFENSIVE on target", i, spellId);
                 me->CastSpell(target, spellId, false);
             }
 
@@ -333,7 +548,7 @@ private:
                 cooldown = 10000; // Min 10s for heals
             else if (isBuffSpell && cooldown < 30000)
                 cooldown = 30000; // Min 30s for buffs
-			else if (cooldown == 0)
+			else
 			{
 				if (spellInfo->CategoryRecoveryTime > cooldown)
 					cooldown = spellInfo->CategoryRecoveryTime;
@@ -356,16 +571,24 @@ private:
             // Regular offensive spells cast naturally via GCD/cast time
 
             if (cooldown > 0)
+            {
                 me->AddSpellCooldown(spellId, 0, cooldown);
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - COOLDOWN SET: {}ms (RecoveryTime={}, CategoryRecoveryTime={}, StartRecoveryTime={})",
+                        i, spellId, cooldown, spellInfo->RecoveryTime, spellInfo->CategoryRecoveryTime, spellInfo->StartRecoveryTime);
+            }
 
             break; // Only cast one spell per update
         }
     }
 
+    CreatureAI* _originalAI;   // The creature's native AI (SmartAI, CombatAI, etc.)
     Player* _owner;
     int32 _updateTimer;
     int32 _combatCheckTimer;
     int32 _regenTimer;
+    int32 _summonCheckTimer = 1000;  // For checking summoned creatures
+    std::vector<ObjectGuid> _summonedGuids;  // Track our summons
 };
 
 /*
@@ -553,8 +776,58 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     // Start following the player
     guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
 
-    // Force AI refresh to use our custom AI
-    guardian->SetAI(new CapturedGuardianAI(guardian));
+    // DEBUG: Log what AI type was created and creature's AIName
+    ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian AIName from template: '{}'",
+        guardian->GetAIName().empty() ? "(none)" : guardian->GetAIName());
+    ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian current AI type: {}",
+        guardian->GetAI() ? typeid(*guardian->GetAI()).name() : "(null)");
+
+    // EXPERIMENTAL: Try NOT replacing the AI - let the creature use its native SmartAI/CombatAI
+    // and just modify its behavior through ownership/faction settings.
+    // Comment out SetAI to test if native AI casts spells properly.
+    //
+    // If spells work without SetAI, the issue is in our AI wrapping approach.
+    // If spells still don't work, the issue is something else (ownership, flags, etc.)
+
+    // For now, let's test WITH our wrapper to preserve follow/protect behavior:
+    CreatureAI* originalAI = FactorySelector::SelectAI(guardian);
+    if (originalAI)
+    {
+        originalAI->InitializeAI();
+        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Initialized original AI");
+    }
+    guardian->SetAI(new CapturedGuardianAI(guardian, originalAI));
+
+    // DEBUG: Log available spells from creature_template.spells[]
+    CreatureTemplate const* cInfo = guardian->GetCreatureTemplate();
+    if (cInfo)
+    {
+        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian spawned - creature_template.spells[]:");
+        bool hasSpells = false;
+        for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
+        {
+            uint32 spellId = cInfo->spells[i];
+            if (spellId)
+            {
+                hasSpells = true;
+                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+                if (spellInfo)
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("  [{}] SpellID: {} - {}",
+                        i, spellId, spellInfo->SpellName[0]);
+                }
+                else
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("  [{}] SpellID: {} - (unknown spell)",
+                        i, spellId);
+                }
+            }
+        }
+        if (!hasSpells)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("  (no spells in creature_template - check SmartAI scripts)");
+        }
+    }
 
     return guardian;
 }
