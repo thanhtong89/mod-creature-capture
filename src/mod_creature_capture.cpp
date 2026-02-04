@@ -12,12 +12,15 @@
 #include "Creature.h"
 #include "CreatureAI.h"
 #include "CreatureAISelector.h"
+#include "DatabaseEnv.h"
 #include "DataMap.h"
+#include "ItemScript.h"
 #include "Map.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
+#include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SpellAuras.h"
 #include "SpellMgr.h"
@@ -28,6 +31,18 @@
 #include <typeinfo>
 #include <vector>
 
+// Tesseract item constant
+constexpr uint32 ITEM_TESSERACT = 90000;
+
+// Gossip menu actions
+enum TesseractGossipActions
+{
+    TESSERACT_ACTION_SUMMON     = 1,
+    TESSERACT_ACTION_DISMISS    = 2,
+    TESSERACT_ACTION_INFO       = 3,
+    TESSERACT_ACTION_RELEASE    = 4
+};
+
 // Constants
 constexpr float GUARDIAN_FOLLOW_DIST = 3.0f;
 constexpr float GUARDIAN_FOLLOW_ANGLE = M_PI / 2; // 90 degrees to the side
@@ -36,12 +51,16 @@ constexpr float GUARDIAN_FOLLOW_ANGLE = M_PI / 2; // 90 degrees to the side
 class CapturedGuardianData : public DataMap::Base
 {
 public:
-    CapturedGuardianData() : guardianGuid(), guardianEntry(0), guardianLevel(0), guardianHealth(0) {}
+    CapturedGuardianData() : guardianGuid(), guardianEntry(0), guardianLevel(0),
+        guardianHealth(0), guardianPower(0), guardianPowerType(0), savedToDb(false) {}
     ObjectGuid guardianGuid;
-    // For respawn after cross-map teleport
+    // For respawn after cross-map teleport and persistence
     uint32 guardianEntry;
     uint8 guardianLevel;
     uint32 guardianHealth;
+    uint32 guardianPower;       // Mana/Rage/Energy value
+    uint8 guardianPowerType;    // 0=mana, 1=rage, 2=focus, 3=energy
+    bool savedToDb;             // Whether this guardian is persisted in DB
 };
 
 /*
@@ -638,6 +657,62 @@ static void DismissGuardian(Player* player)
     }
 }
 
+// Database persistence functions
+static void SaveGuardianToDb(Player* player, CapturedGuardianData* data)
+{
+    if (!data || data->guardianEntry == 0)
+        return;
+
+    uint32 ownerGuid = player->GetGUID().GetCounter();
+
+    // Use transaction for atomicity
+    auto trans = CharacterDatabase.BeginTransaction();
+
+    trans->Append("DELETE FROM character_guardian WHERE owner = {}", ownerGuid);
+    trans->Append(
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, save_time) "
+        "VALUES ({}, {}, {}, 0, {}, {}, {}, UNIX_TIMESTAMP())",
+        ownerGuid,
+        data->guardianEntry,
+        data->guardianLevel,
+        data->guardianHealth,
+        data->guardianPower,
+        data->guardianPowerType
+    );
+
+    CharacterDatabase.CommitTransaction(trans);
+    data->savedToDb = true;
+}
+
+static void LoadGuardianFromDb(Player* player)
+{
+    uint32 ownerGuid = player->GetGUID().GetCounter();
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT entry, level, cur_health, cur_power, power_type FROM character_guardian WHERE owner = {} AND slot = 0",
+        ownerGuid
+    );
+
+    if (!result)
+        return;
+
+    Field* fields = result->Fetch();
+
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    data->guardianEntry = fields[0].Get<uint32>();
+    data->guardianLevel = fields[1].Get<uint8>();
+    data->guardianHealth = fields[2].Get<uint32>();
+    data->guardianPower = fields[3].Get<uint32>();
+    data->guardianPowerType = fields[4].Get<uint8>();
+    data->savedToDb = true;
+}
+
+static void DeleteGuardianFromDb(Player* player)
+{
+    uint32 ownerGuid = player->GetGUID().GetCounter();
+    CharacterDatabase.Execute("DELETE FROM character_guardian WHERE owner = {}", ownerGuid);
+}
+
 static bool CanCaptureCreature(Player* player, Creature* target, std::string& error)
 {
     if (!target)
@@ -975,16 +1050,62 @@ public:
 
     void OnPlayerLogin(Player* player) override
     {
-        if (config.enabled && config.announce)
+        if (!config.enabled)
+            return;
+
+        // Load guardian data from database
+        LoadGuardianFromDb(player);
+
+        // Give player a Tesseract if they don't have one
+        if (!player->HasItemCount(ITEM_TESSERACT, 1))
+        {
+            if (player->AddItem(ITEM_TESSERACT, 1))
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Creature Capture]|r You have received a Tesseract! Use it to capture and summon guardians.");
+            }
+        }
+
+        // Notify if they have a stored guardian
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        if (data->guardianEntry != 0)
+        {
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry);
+            std::string name = cInfo ? cInfo->Name : "Guardian";
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff00ff00[Creature Capture]|r Your guardian {} is stored in the Tesseract. Use it to summon!", name);
+        }
+        else if (config.announce)
         {
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff00ff00[Creature Capture]|r Use .capture to capture a targeted NPC as your guardian!");
+                "|cff00ff00[Creature Capture]|r Target a creature and use your Tesseract to capture it!");
         }
     }
 
     void OnPlayerLogout(Player* player) override
     {
-        // Dismiss guardian on logout
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        // If guardian is active, store its current state
+        if (data->guardianGuid)
+        {
+            if (Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid))
+            {
+                data->guardianEntry = guardian->GetEntry();
+                data->guardianLevel = guardian->GetLevel();
+                data->guardianHealth = guardian->GetHealth();
+                data->guardianPowerType = guardian->getPowerType();
+                data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
+            }
+        }
+
+        // Save to database if we have a guardian
+        if (data->guardianEntry != 0)
+        {
+            SaveGuardianToDb(player, data);
+        }
+
+        // Dismiss the active guardian
         DismissGuardian(player);
     }
 
@@ -1063,10 +1184,264 @@ public:
     }
 };
 
+/*
+ * Tesseract Item Script
+ * Handles the Tesseract item for summoning/dismissing guardians via gossip menu
+ */
+class TesseractItemScript : public ItemScript
+{
+public:
+    TesseractItemScript() : ItemScript("item_tesseract") {}
+
+    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
+    {
+        if (!player || !item)
+            return false;
+
+        // DEBUG
+        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Tesseract OnUse called!");
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        // Check if player has an active guardian
+        bool hasActiveGuardian = false;
+        Creature* guardian = nullptr;
+
+        if (data->guardianGuid)
+        {
+            guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+            if (guardian && guardian->IsAlive())
+                hasActiveGuardian = true;
+        }
+
+        // Check if player has a stored guardian
+        bool hasStoredGuardian = (data->guardianEntry != 0);
+
+        // Check if player has a valid capture target
+        Creature* target = ObjectAccessor::GetCreatureOrPetOrVehicle(*player, player->GetTarget());
+
+        // DIRECT CAPTURE: If targeting a creature and don't have a guardian yet, capture directly!
+        if (target && !hasActiveGuardian && !hasStoredGuardian)
+        {
+            std::string error;
+            if (CanCaptureCreature(player, target, error))
+            {
+                // Perform capture directly - no gossip menu needed
+                uint32 entry = target->GetEntry();
+                uint8 level = target->GetLevel();
+
+                // Despawn the original creature
+                target->DespawnOrUnsummon();
+
+                // Summon as guardian
+                TempSummon* newGuardian = SummonCapturedGuardian(player, entry, level);
+                if (newGuardian)
+                {
+                    data->guardianGuid = newGuardian->GetGUID();
+                    data->guardianEntry = entry;
+                    data->guardianLevel = level;
+                    data->guardianHealth = newGuardian->GetHealth();
+                    data->guardianPowerType = newGuardian->getPowerType();
+                    data->guardianPower = newGuardian->GetPower(Powers(data->guardianPowerType));
+
+                    // Save to database
+                    SaveGuardianToDb(player, data);
+
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff00ff00[Tesseract]|r {} has been captured!", newGuardian->GetName());
+                }
+                else
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff0000[Tesseract]|r Failed to capture creature.");
+                }
+                return true;
+            }
+            else
+            {
+                // Can't capture - show error
+                ChatHandler(player->GetSession()).PSendSysMessage("|cffff0000[Tesseract]|r {}", error);
+                return true;
+            }
+        }
+
+        // Otherwise, open gossip menu for summon/dismiss/info
+        ClearGossipMenuFor(player);
+
+        if (hasActiveGuardian)
+        {
+            // Guardian is out - offer to dismiss or release
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Dismiss " + std::string(guardian->GetName()),
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_DISMISS);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Guardian Info",
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_INFO);
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                "Release Guardian (permanent)",
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_RELEASE);
+        }
+        else if (hasStoredGuardian)
+        {
+            // Guardian is stored - offer to summon or release
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry);
+            std::string name = cInfo ? cInfo->Name : "Guardian";
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Summon " + name,
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_SUMMON);
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
+                "Release Guardian (permanent)",
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_RELEASE);
+        }
+        else
+        {
+            // No guardian and no valid target
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                "Target a creature and use the Tesseract to capture it!",
+                GOSSIP_SENDER_MAIN, 0);
+        }
+
+        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, item->GetGUID());
+        return true;
+    }
+
+    void OnGossipSelect(Player* player, Item* /*item*/, uint32 /*sender*/, uint32 action) override
+    {
+        CloseGossipMenuFor(player);
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        switch (action)
+        {
+            case TESSERACT_ACTION_SUMMON:
+            {
+                if (data->guardianEntry == 0)
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("No guardian stored in Tesseract.");
+                    return;
+                }
+
+                // Summon the guardian
+                TempSummon* guardian = SummonCapturedGuardian(player, data->guardianEntry, data->guardianLevel);
+                if (guardian)
+                {
+                    // Restore health and power
+                    if (data->guardianHealth > 0 && data->guardianHealth <= guardian->GetMaxHealth())
+                        guardian->SetHealth(data->guardianHealth);
+                    if (data->guardianPower > 0)
+                        guardian->SetPower(Powers(data->guardianPowerType), data->guardianPower);
+
+                    data->guardianGuid = guardian->GetGUID();
+
+                    ChatHandler(player->GetSession()).PSendSysMessage("|cff00ff00[Tesseract]|r {} has been summoned!",
+                        guardian->GetName());
+                }
+                else
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("|cffff0000[Tesseract]|r Failed to summon guardian.");
+                }
+                break;
+            }
+            case TESSERACT_ACTION_DISMISS:
+            {
+                if (!data->guardianGuid)
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("No active guardian to dismiss.");
+                    return;
+                }
+
+                Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+                if (guardian && guardian->IsAlive())
+                {
+                    // Store guardian state before dismissing
+                    data->guardianEntry = guardian->GetEntry();
+                    data->guardianLevel = guardian->GetLevel();
+                    data->guardianHealth = guardian->GetHealth();
+                    data->guardianPowerType = guardian->getPowerType();
+                    data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
+
+                    std::string name = guardian->GetName();
+
+                    // Despawn
+                    guardian->DespawnOrUnsummon();
+                    data->guardianGuid.Clear();
+
+                    ChatHandler(player->GetSession()).PSendSysMessage("|cff00ff00[Tesseract]|r {} has been stored.",
+                        name);
+                }
+                else
+                {
+                    data->guardianGuid.Clear();
+                    ChatHandler(player->GetSession()).PSendSysMessage("Guardian not found.");
+                }
+                break;
+            }
+            case TESSERACT_ACTION_INFO:
+            {
+                if (!data->guardianGuid)
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("No active guardian.");
+                    return;
+                }
+
+                Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+                if (guardian)
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("=== Guardian Info ===");
+                    ChatHandler(player->GetSession()).PSendSysMessage("Name: {}", guardian->GetName());
+                    ChatHandler(player->GetSession()).PSendSysMessage("Level: {}", guardian->GetLevel());
+                    ChatHandler(player->GetSession()).PSendSysMessage("Health: {} / {}",
+                        guardian->GetHealth(), guardian->GetMaxHealth());
+                    ChatHandler(player->GetSession()).PSendSysMessage("Entry: {}", guardian->GetEntry());
+                }
+                break;
+            }
+            case TESSERACT_ACTION_RELEASE:
+            {
+                // Get name before we clear everything
+                std::string name = "Guardian";
+                if (data->guardianGuid)
+                {
+                    if (Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid))
+                    {
+                        name = guardian->GetName();
+                        guardian->DespawnOrUnsummon();
+                    }
+                }
+                else if (data->guardianEntry)
+                {
+                    if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry))
+                        name = cInfo->Name;
+                }
+
+                // Clear all guardian data
+                data->guardianGuid.Clear();
+                data->guardianEntry = 0;
+                data->guardianLevel = 0;
+                data->guardianHealth = 0;
+                data->guardianPower = 0;
+                data->guardianPowerType = 0;
+                data->savedToDb = false;
+
+                // Delete from database
+                DeleteGuardianFromDb(player);
+
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff6600[Tesseract]|r {} has been released into the wild.", name);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+};
+
+
 // Register scripts
 void AddSC_mod_creature_capture()
 {
     new CreatureCaptureCommandScript();
     new CreatureCapturePlayerScript();
     new CreatureCaptureWorldScript();
+    new TesseractItemScript();
 }
