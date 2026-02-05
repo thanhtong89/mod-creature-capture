@@ -85,15 +85,6 @@ public:
         {
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
         }
-
-        // DEBUG: Log what AI we're wrapping
-        if (_owner)
-        {
-            if (_originalAI)
-                ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Guardian AI wrapping original AI: {}", typeid(*_originalAI).name());
-            else
-                ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Guardian AI has no original AI to wrap (using fallback spell logic)");
-        }
     }
 
     ~CapturedGuardianAI()
@@ -284,10 +275,6 @@ public:
         if (!summon || !_owner)
             return;
 
-        if (_owner)
-            ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] JustSummoned called for: {} (entry {})",
-                summon->GetName(), summon->GetEntry());
-
         // 1. Set owner to the player (not the guardian) so it's treated as player's minion
         summon->SetOwnerGUID(_owner->GetGUID());
         summon->SetCreatorGUID(_owner->GetGUID());
@@ -378,9 +365,6 @@ public:
 
     void JustEngagedWith(Unit* who) override
     {
-        if (_owner)
-            ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] JustEngagedWith called, target: {}", who ? who->GetName() : "(null)");
-
         if (_originalAI)
             _originalAI->JustEngagedWith(who);
     }
@@ -472,9 +456,6 @@ private:
             // Check cooldown
             if (me->HasSpellCooldown(spellId))
             {
-                // DEBUG: show when spell is skipped due to cooldown
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - ON COOLDOWN, skipping", i, spellId);
                 continue;
             }
 
@@ -495,14 +476,10 @@ private:
                 // Only cast healing spells when health is below 40%
                 if (me->GetHealthPct() > 40.0f)
                 {
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - HEAL skipped (HP {}% > 40%)", i, spellId, static_cast<int>(me->GetHealthPct()));
                     continue;
                 }
 
                 // Cast on self
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING HEAL on self", i, spellId);
                 me->CastSpell(me, spellId, false);
             }
             else if (isBuffSpell)
@@ -510,14 +487,10 @@ private:
                 // Check if we already have this buff
                 if (me->HasAura(spellId))
                 {
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - BUFF skipped (already have aura)", i, spellId);
                     continue;
                 }
 
                 // Cast on self
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING BUFF on self", i, spellId);
                 me->CastSpell(me, spellId, false);
             }
             else if (isPeriodicSpell)
@@ -525,8 +498,6 @@ private:
                 // Don't reapply DoTs if target already has them
                 if (target->HasAura(spellId, me->GetGUID()))
                 {
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - DOT skipped (target has aura)", i, spellId);
                     continue;
                 }
 
@@ -534,14 +505,10 @@ private:
                 if (spellInfo->GetMaxRange(false) > 0 &&
                     !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
                 {
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - DOT skipped (out of range)", i, spellId);
                     continue;
                 }
 
                 // Cast on target
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING DOT on target", i, spellId);
                 me->CastSpell(target, spellId, false);
             }
             else
@@ -550,14 +517,10 @@ private:
                 if (spellInfo->GetMaxRange(false) > 0 &&
                     !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
                 {
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - OFFENSIVE skipped (out of range)", i, spellId);
                     continue;
                 }
 
                 // Cast on target
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - CASTING OFFENSIVE on target", i, spellId);
                 me->CastSpell(target, spellId, false);
             }
 
@@ -592,9 +555,6 @@ private:
             if (cooldown > 0)
             {
                 me->AddSpellCooldown(spellId, 0, cooldown);
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage("[DEBUG] Slot [{}] SpellID {} - COOLDOWN SET: {}ms (RecoveryTime={}, CategoryRecoveryTime={}, StartRecoveryTime={})",
-                        i, spellId, cooldown, spellInfo->RecoveryTime, spellInfo->CategoryRecoveryTime, spellInfo->StartRecoveryTime);
             }
 
             break; // Only cast one spell per update
@@ -852,10 +812,10 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
 
     // DEBUG: Log what AI type was created and creature's AIName
-    ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian AIName from template: '{}'",
-        guardian->GetAIName().empty() ? "(none)" : guardian->GetAIName());
-    ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian current AI type: {}",
-        guardian->GetAI() ? typeid(*guardian->GetAI()).name() : "(null)");
+    // ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian AIName from template: '{}'",
+    //     guardian->GetAIName().empty() ? "(none)" : guardian->GetAIName());
+    // ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian current AI type: {}",
+    //     guardian->GetAI() ? typeid(*guardian->GetAI()).name() : "(null)");
 
     // EXPERIMENTAL: Try NOT replacing the AI - let the creature use its native SmartAI/CombatAI
     // and just modify its behavior through ownership/faction settings.
@@ -869,40 +829,8 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     if (originalAI)
     {
         originalAI->InitializeAI();
-        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Initialized original AI");
     }
     guardian->SetAI(new CapturedGuardianAI(guardian, originalAI));
-
-    // DEBUG: Log available spells from creature_template.spells[]
-    CreatureTemplate const* cInfo = guardian->GetCreatureTemplate();
-    if (cInfo)
-    {
-        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Guardian spawned - creature_template.spells[]:");
-        bool hasSpells = false;
-        for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
-        {
-            uint32 spellId = cInfo->spells[i];
-            if (spellId)
-            {
-                hasSpells = true;
-                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
-                if (spellInfo)
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage("  [{}] SpellID: {} - {}",
-                        i, spellId, spellInfo->SpellName[0]);
-                }
-                else
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage("  [{}] SpellID: {} - (unknown spell)",
-                        i, spellId);
-                }
-            }
-        }
-        if (!hasSpells)
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("  (no spells in creature_template - check SmartAI scripts)");
-        }
-    }
 
     return guardian;
 }
@@ -1197,9 +1125,6 @@ public:
     {
         if (!player || !item)
             return false;
-
-        // DEBUG
-        ChatHandler(player->GetSession()).PSendSysMessage("[DEBUG] Tesseract OnUse called!");
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
