@@ -31,8 +31,8 @@
 #include <typeinfo>
 #include <vector>
 
-// Tesseract item constant
-constexpr uint32 ITEM_TESSERACT = 90000;
+// Tesseract item constant (uses existing item 44807 from client Item.dbc)
+constexpr uint32 ITEM_TESSERACT = 44807;
 
 // Gossip menu actions
 enum TesseractGossipActions
