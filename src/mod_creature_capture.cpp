@@ -473,14 +473,18 @@ private:
             // Apply conditions for different spell types
             if (isHealingSpell)
             {
-                // Only cast healing spells when health is below 40%
-                if (me->GetHealthPct() > 40.0f)
-                {
-                    continue;
-                }
+                // Prioritize healing owner if they need it, then self
+                Unit* healTarget = nullptr;
 
-                // Cast on self
-                me->CastSpell(me, spellId, false);
+                if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 40.0f)
+                    healTarget = _owner;
+                else if (me->GetHealthPct() < 40.0f)
+                    healTarget = me;
+
+                if (!healTarget)
+                    continue;
+
+                me->CastSpell(healTarget, spellId, false);
             }
             else if (isBuffSpell)
             {
@@ -849,9 +853,10 @@ public:
     {
         static ChatCommandTable captureCommandTable =
         {
-            { "",           HandleCaptureCommand,    SEC_PLAYER, Console::No },
-            { "dismiss",    HandleDismissCommand,    SEC_PLAYER, Console::No },
-            { "info",       HandleInfoCommand,       SEC_PLAYER, Console::No },
+            { "",           HandleCaptureCommand,    SEC_PLAYER,        Console::No },
+            { "dismiss",    HandleDismissCommand,    SEC_PLAYER,        Console::No },
+            { "info",       HandleInfoCommand,       SEC_PLAYER,        Console::No },
+            { "spawn",      HandleSpawnCommand,      SEC_GAMEMASTER,    Console::No },
         };
 
         static ChatCommandTable commandTable =
@@ -910,6 +915,51 @@ public:
         handler->PSendSysMessage("You have captured {} (Level {})! It will now follow and protect you!",
             name, level);
 
+        return true;
+    }
+
+    static bool HandleSpawnCommand(ChatHandler* handler, uint32 creatureEntry)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player)
+            return false;
+
+        // Check if creature entry is valid
+        CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(creatureEntry);
+        if (!cInfo)
+        {
+            handler->PSendSysMessage("Creature entry {} does not exist.", creatureEntry);
+            return true;
+        }
+
+        // Check if player already has a guardian
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        if (data->guardianGuid || data->guardianEntry != 0)
+        {
+            handler->PSendSysMessage("You already have a guardian. Dismiss or release it first.");
+            return true;
+        }
+
+        // Summon as guardian at the player's level
+        uint8 level = player->GetLevel();
+        TempSummon* guardian = SummonCapturedGuardian(player, creatureEntry, level);
+        if (!guardian)
+        {
+            handler->PSendSysMessage("Failed to summon guardian.");
+            return true;
+        }
+
+        data->guardianGuid = guardian->GetGUID();
+        data->guardianEntry = creatureEntry;
+        data->guardianLevel = level;
+        data->guardianHealth = guardian->GetHealth();
+        data->guardianPowerType = guardian->getPowerType();
+        data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
+
+        SaveGuardianToDb(player, data);
+
+        handler->PSendSysMessage("GM captured {} (Entry {}) at level {}.",
+            cInfo->Name, creatureEntry, level);
         return true;
     }
 
