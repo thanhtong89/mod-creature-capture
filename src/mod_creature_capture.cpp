@@ -326,6 +326,9 @@ public:
     {
         if (slot < MAX_GUARDIAN_SPELLS)
             _spellSlots[slot] = spellId;
+
+        if (spellId)
+            EquipFallbackWeaponForSpell(spellId);
     }
 
     uint32 GetSpell(uint32 slot) const
@@ -450,6 +453,18 @@ public:
                         }
                     }
 
+                    // Defend fellow guardians being attacked
+                    if (!me->GetVictim())
+                    {
+                        Unit* allyAttacker = FindAllyAttacker();
+                        if (allyAttacker)
+                        {
+                            AttackStart(allyAttacker);
+                            return;
+                        }
+                    }
+
+                    // Defend self from attackers
                     if (!me->GetVictim())
                     {
                         for (Unit* attacker : me->getAttackers())
@@ -549,12 +564,7 @@ public:
         }
 
         if (me->Attack(target, true))
-        {
-            if (_archetype == ARCHETYPE_HEALER)
-                me->SetFacingToObject(target);
-            else
-                me->GetMotionMaster()->MoveChase(target);
-        }
+            me->GetMotionMaster()->MoveChase(target);
     }
 
     void EnterEvadeMode(EvadeReason /*why*/) override
@@ -598,6 +608,65 @@ public:
     }
 
 private:
+    // Find an enemy attacking any fellow guardian
+    Unit* FindAllyAttacker()
+    {
+        if (!_owner)
+            return nullptr;
+
+        CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                continue;
+
+            Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+            if (!ally || !ally->IsAlive())
+                continue;
+
+            for (Unit* attacker : ally->getAttackers())
+            {
+                if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                    return attacker;
+            }
+        }
+        return nullptr;
+    }
+
+    // Equip a fallback weapon if the spell requires one and the creature lacks it
+    void EquipFallbackWeaponForSpell(uint32 spellId)
+    {
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            return;
+
+        // Check for ranged weapon need: DmgClass ranged, or uses ranged slot, or auto-repeat
+        bool needsRanged = (spellInfo->DmgClass == SPELL_DAMAGE_CLASS_RANGED &&
+                            spellInfo->IsRangedWeaponSpell()) ||
+                           spellInfo->HasAttribute(SPELL_ATTR0_USES_RANGED_SLOT);
+
+        if (needsRanged && !me->HasWeapon(RANGED_ATTACK))
+        {
+            // 2504 = Worn Shortbow (common item in all AzerothCore DBs)
+            me->SetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + 2, 2504);
+            return;
+        }
+
+        // Check for melee weapon need: DmgClass melee with weapon damage effects
+        bool needsMelee = spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE &&
+                          (spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE) ||
+                           spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) ||
+                           spellInfo->HasEffect(SPELL_EFFECT_NORMALIZED_WEAPON_DMG) ||
+                           spellInfo->HasAttribute(SPELL_ATTR3_REQUIRES_MAIN_HAND_WEAPON));
+
+        if (needsMelee && !me->HasWeapon(BASE_ATTACK))
+        {
+            // 25 = Worn Shortsword (common item in all AzerothCore DBs)
+            me->SetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID, 25);
+        }
+    }
+
     void UpdateDpsAI(uint32 /*diff*/)
     {
         DoMeleeAttackIfReady();
@@ -610,12 +679,40 @@ private:
 
         if (_owner)
         {
+            // Collect healer guardians to protect
+            std::vector<ObjectGuid> healerGuids;
+            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (s.IsActive() && s.guardianGuid != me->GetGUID() && s.archetype == ARCHETYPE_HEALER)
+                    healerGuids.push_back(s.guardianGuid);
+            }
+
             for (auto const& ref : me->GetThreatMgr().GetThreatList())
             {
                 if (Unit* target = ref->getTarget())
                 {
-                    if (target->GetVictim() == _owner)
+                    Unit* targetVictim = target->GetVictim();
+                    if (!targetVictim)
+                        continue;
+
+                    // Protect owner
+                    if (targetVictim == _owner)
+                    {
                         me->AddThreat(target, 50.0f);
+                        continue;
+                    }
+
+                    // Protect healer guardians
+                    for (ObjectGuid const& healerGuid : healerGuids)
+                    {
+                        if (targetVictim->GetGUID() == healerGuid)
+                        {
+                            me->AddThreat(target, 80.0f);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -626,12 +723,25 @@ private:
 
     void UpdateHealerAI(uint32 /*diff*/)
     {
-        bool healed = DoCastHealingSpells();
-        if (!healed)
-        {
-            DoCastSelfBuffs();
-            DoCastOffensiveSpells();
-        }
+        // Priority 1: Heal owner/self if needed
+        if (DoCastHealingSpells())
+            return;
+
+        // Priority 2: Maintain self buffs
+        if (DoCastSelfBuffs())
+            return;
+
+        // Priority 3: Buff allies (owner + other guardians)
+        if (DoCastAllyBuffs())
+            return;
+
+        // Priority 4: Debuff current target
+        if (DoCastDebuffSpells())
+            return;
+
+        // Priority 5: Offensive spells + melee
+        DoMeleeAttackIfReady();
+        DoCastOffensiveSpells();
     }
 
     void DoCastOffensiveSpells()
@@ -680,11 +790,33 @@ private:
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
 
+        // Build prioritized list of heal targets
         Unit* healTarget = nullptr;
-        if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
+
+        // Owner at 50% or below is top priority
+        if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
             healTarget = _owner;
-        else if (me->GetHealthPct() < 60.0f)
+        // Self at 50%
+        else if (me->GetHealthPct() < 50.0f)
             healTarget = me;
+        // Check other guardians belonging to owner
+        else if (_owner)
+        {
+            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                    continue;
+
+                Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+                if (ally && ally->IsAlive() && ally->GetHealthPct() < 50.0f)
+                {
+                    healTarget = ally;
+                    break;
+                }
+            }
+        }
 
         if (!healTarget)
             return false;
@@ -714,11 +846,12 @@ private:
         return false;
     }
 
-    void DoCastSelfBuffs()
+    bool DoCastSelfBuffs()
     {
         if (me->HasUnitState(UNIT_STATE_CASTING))
-            return;
+            return false;
 
+        bool cast = false;
         for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
         {
             uint32 spellId = _spellSlots[i];
@@ -741,8 +874,131 @@ private:
 
             me->CastSpell(me, spellId, false);
             ApplySpellCooldown(spellId, spellInfo, false);
+            cast = true;
             break;
         }
+        return cast;
+    }
+
+    bool DoCastAllyBuffs()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING) || !_owner)
+            return false;
+
+        // Collect allies: owner + other active guardians
+        std::vector<Unit*> allies;
+        if (_owner->IsAlive())
+            allies.push_back(_owner);
+
+        CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                continue;
+
+            Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+            if (ally && ally->IsAlive() && me->IsWithinDistInMap(ally, 30.0f))
+                allies.push_back(ally);
+        }
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo || !spellInfo->IsPositive())
+                continue;
+
+            if (spellInfo->HasEffect(SPELL_EFFECT_HEAL))
+                continue;
+
+            // Must have an aura component to be a buff
+            bool hasBuff = false;
+            for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
+            {
+                if (spellInfo->Effects[eff].IsAura())
+                {
+                    hasBuff = true;
+                    break;
+                }
+            }
+            if (!hasBuff)
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            // Find an ally missing this buff
+            for (Unit* ally : allies)
+            {
+                if (ally->HasAura(spellId))
+                    continue;
+
+                me->CastSpell(ally, spellId, false);
+                ApplySpellCooldown(spellId, spellInfo, false);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool DoCastDebuffSpells()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING))
+            return false;
+
+        Unit* target = me->GetVictim();
+        if (!target)
+            return false;
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo || spellInfo->IsPositive())
+                continue;
+
+            // Skip direct damage spells — those are handled by DoCastOffensiveSpells
+            if (spellInfo->HasEffect(SPELL_EFFECT_SCHOOL_DAMAGE) ||
+                spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE) ||
+                spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) ||
+                spellInfo->HasEffect(SPELL_EFFECT_NORMALIZED_WEAPON_DMG))
+                continue;
+
+            // Must have an aura component (debuff)
+            bool hasDebuff = false;
+            for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
+            {
+                if (spellInfo->Effects[eff].IsAura())
+                {
+                    hasDebuff = true;
+                    break;
+                }
+            }
+            if (!hasDebuff)
+                continue;
+
+            if (target->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            if (spellInfo->GetMaxRange(false) > 0 &&
+                !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                continue;
+
+            me->CastSpell(target, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo, false);
+            return true;
+        }
+        return false;
     }
 
     void ApplySpellCooldown(uint32 spellId, SpellInfo const* spellInfo, bool isHeal)
@@ -1102,7 +1358,13 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_ATTACKABLE_1);
     guardian->SetFaction(player->GetFaction());
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
+    guardian->SetFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP);
     guardian->SetReactState(REACT_DEFENSIVE);
+
+    // Clear any inherited threat/combat state from the creature template
+    guardian->GetThreatMgr().ClearAllThreat();
+    guardian->CombatStop(true);
+    guardian->GetMotionMaster()->Clear();
 
     if (config.healthPct != 100)
     {
