@@ -222,6 +222,7 @@ struct GuardianSlotData
     uint32 spellSlots[MAX_GUARDIAN_SPELLS] = {};
     uint32 displayId        = 0;
     int8   equipmentId      = 0;
+    bool   dismissed        = false;
     bool   savedToDb        = false;
 
     void Clear()
@@ -236,6 +237,7 @@ struct GuardianSlotData
         memset(spellSlots, 0, sizeof(spellSlots));
         displayId = 0;
         equipmentId = 0;
+        dismissed = false;
         savedToDb = false;
     }
 
@@ -1122,8 +1124,8 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
     auto trans = CharacterDatabase.BeginTransaction();
     trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
-        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, UNIX_TIMESTAMP())",
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, dismissed, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1134,7 +1136,8 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         slotData->archetype,
         spellStr,
         slotData->displayId,
-        slotData->equipmentId
+        slotData->equipmentId,
+        slotData->dismissed ? 1 : 0
     );
     CharacterDatabase.CommitTransaction(trans);
     slotData->savedToDb = true;
@@ -1155,7 +1158,7 @@ static void LoadGuardiansFromDb(Player* player)
     uint32 ownerGuid = player->GetGUID().GetCounter();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id "
+        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, dismissed "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
@@ -1182,6 +1185,7 @@ static void LoadGuardiansFromDb(Player* player)
         DeserializeSpells(fields[7].Get<std::string>(), s.spellSlots);
         s.displayId         = fields[8].Get<uint32>();
         s.equipmentId       = fields[9].Get<int8>();
+        s.dismissed         = fields[10].Get<uint8>() != 0;
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -1581,6 +1585,7 @@ public:
 
         SnapshotGuardianSlot(player, static_cast<uint8>(slot));
         DismissGuardianSlot(player, static_cast<uint8>(slot));
+        s.dismissed = true;
         SaveGuardianSlotToDb(player, &s, static_cast<uint8>(slot));
 
         handler->PSendSysMessage("Guardian in slot {} has been dismissed.", slot + 1);
@@ -1824,14 +1829,38 @@ public:
         bool anyOccupied = false;
         for (uint8 i = 0; i < config.maxSlots; ++i)
         {
-            if (data->slots[i].IsOccupied())
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsOccupied())
+                continue;
+
+            anyOccupied = true;
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
+            std::string name = cInfo ? cInfo->Name : "Guardian";
+
+            if (!s.dismissed)
             {
-                CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->slots[i].guardianEntry);
-                std::string name = cInfo ? cInfo->Name : "Guardian";
+                // Auto-summon guardians that were not explicitly dismissed
+                TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
+                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId);
+                if (guardian)
+                {
+                    if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
+                        guardian->SetHealth(s.guardianHealth);
+                    if (s.guardianPower > 0)
+                        guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
+
+                    s.guardianGuid = guardian->GetGUID();
+
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff00ff00[Creature Capture]|r Slot {}: {} ({}) summoned.",
+                        i + 1, name, ArchetypeName(s.archetype));
+                }
+            }
+            else
+            {
                 ChatHandler(player->GetSession()).PSendSysMessage(
                     "|cff00ff00[Creature Capture]|r Slot {}: {} ({}) stored in Tesseract.",
-                    i + 1, name, ArchetypeName(data->slots[i].archetype));
-                anyOccupied = true;
+                    i + 1, name, ArchetypeName(s.archetype));
             }
         }
 
@@ -2124,10 +2153,12 @@ public:
                         guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
                     s.guardianGuid = guardian->GetGUID();
+                    s.dismissed = false;
 
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff00ff00[Tesseract]|r {} summoned from slot {}!", guardian->GetName(), slot + 1);
 
+                    SaveGuardianSlotToDb(player, &s, slot);
                     SendFullSlotState(player, slot, s);
                 }
                 else
@@ -2152,6 +2183,7 @@ public:
                     std::string name = guardian->GetName();
                     guardian->DespawnOrUnsummon();
                     s.guardianGuid.Clear();
+                    s.dismissed = true;
 
                     SaveGuardianSlotToDb(player, &s, slot);
 
@@ -2162,6 +2194,7 @@ public:
                 else
                 {
                     s.guardianGuid.Clear();
+                    s.dismissed = true;
                     ChatHandler(player->GetSession()).PSendSysMessage("Guardian not found.");
                 }
                 break;

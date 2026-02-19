@@ -16,6 +16,7 @@ CREATE TABLE `character_guardian` (
     `spells` VARCHAR(200) DEFAULT '' COMMENT 'Comma-separated spell IDs for 8 slots',
     `display_id` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Creature display ID for model restoration',
     `equipment_id` TINYINT NOT NULL DEFAULT 0 COMMENT 'Equipment template ID for weapon restoration',
+    `dismissed` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '1=explicitly dismissed, 0=auto-summon on login',
     `save_time` INT UNSIGNED NOT NULL DEFAULT 0,
     PRIMARY KEY (`id`),
     UNIQUE KEY `idx_owner_slot` (`owner`, `slot`)
