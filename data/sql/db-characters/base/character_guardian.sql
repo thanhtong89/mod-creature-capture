@@ -12,6 +12,8 @@ CREATE TABLE `character_guardian` (
     `cur_health` INT UNSIGNED NOT NULL DEFAULT 1,
     `cur_power` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Mana/Rage/Energy value',
     `power_type` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=mana, 1=rage, 2=focus, 3=energy',
+    `archetype` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=DPS, 1=Tank, 2=Healer',
+    `spells` VARCHAR(200) DEFAULT '' COMMENT 'Comma-separated spell IDs for 8 slots',
     `save_time` INT UNSIGNED NOT NULL DEFAULT 0,
     PRIMARY KEY (`id`),
     KEY `idx_owner` (`owner`),

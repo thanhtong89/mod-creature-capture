@@ -1,0 +1,5 @@
+## Interface: 30300
+## Title: Creature Capture - Guardian Spellbook
+## Notes: Spellbook UI for managing captured guardian abilities
+## SavedVariables: CreatureCaptureDB
+CreatureCapture.lua
