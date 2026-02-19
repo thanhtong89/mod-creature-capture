@@ -41,3 +41,7 @@ CreatureCapture.HealthPct = 100
 # Guardian damage percentage of original creature
 # Default: 100
 CreatureCapture.DamagePct = 100
+
+# Maximum number of guardian slots per player (1-4)
+# Default: 4
+CreatureCapture.MaxSlots = 4

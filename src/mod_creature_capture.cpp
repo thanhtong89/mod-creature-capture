@@ -4,8 +4,7 @@
  *
  * Creature Capture Module
  * Allows players to capture NPCs and turn them into guardian companions.
- * Guardians use an archetype system (Tank/DPS/Healer) instead of delegating
- * to the creature's native AI.
+ * Supports up to 4 guardian slots per player with archetype system (Tank/DPS/Healer).
  */
 
 #include "Chat.h"
@@ -30,6 +29,8 @@
 #include "WorldPacket.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <iomanip>
 #include <sstream>
 #include <vector>
 
@@ -39,22 +40,43 @@ constexpr uint32 ITEM_TESSERACT = 44807;
 // Addon message prefix
 static constexpr char ADDON_PREFIX[] = "CCAPTURE";
 
-// Gossip menu actions — Tesseract item
-enum TesseractGossipActions
-{
-    TESSERACT_ACTION_SUMMON     = 1,
-    TESSERACT_ACTION_DISMISS    = 2,
-    TESSERACT_ACTION_INFO       = 3,
-    TESSERACT_ACTION_RELEASE    = 4
+// Limits
+constexpr uint32 MAX_GUARDIAN_SLOTS  = 4;
+constexpr uint32 MAX_GUARDIAN_SPELLS = 8;
+
+// Follow distances
+constexpr float GUARDIAN_FOLLOW_DIST = 3.0f;
+constexpr float HEALER_FOLLOW_DIST   = 12.0f;
+
+// Follow angles per slot (spread around player)
+// Slot 0: front-right (~45deg), Slot 1: back-right (~135deg),
+// Slot 2: back-left (~225deg), Slot 3: front-left (~315deg)
+static const float GUARDIAN_FOLLOW_ANGLES[MAX_GUARDIAN_SLOTS] = {
+    static_cast<float>(M_PI / 4.0),          // 45
+    static_cast<float>(3.0 * M_PI / 4.0),    // 135
+    static_cast<float>(5.0 * M_PI / 4.0),    // 225
+    static_cast<float>(7.0 * M_PI / 4.0),    // 315
 };
 
-// Gossip menu actions — Guardian NPC (archetype selection)
+// Gossip action encoding for Tesseract item:
+//   encoded = slot * 10 + action   (actions 1-4)
+//   decode:  slot = encoded / 10,  action = encoded % 10
+enum TesseractGossipActions
+{
+    TESSERACT_ACTION_SUMMON  = 1,
+    TESSERACT_ACTION_DISMISS = 2,
+    TESSERACT_ACTION_INFO    = 3,
+    TESSERACT_ACTION_RELEASE = 4,
+    TESSERACT_ACTION_CLOSE   = 99
+};
+
+// Guardian gossip action encoding:
+//   encoded = 100 + slot * 10 + archetype   (archetype 0-2)
+//   decode:  slot = (encoded - 100) / 10,   archetype = (encoded - 100) % 10
 enum GuardianGossipActions
 {
-    GUARDIAN_ACTION_ARCHETYPE_DPS    = 100,
-    GUARDIAN_ACTION_ARCHETYPE_TANK   = 101,
-    GUARDIAN_ACTION_ARCHETYPE_HEALER = 102,
-    GUARDIAN_ACTION_CLOSE            = 199
+    GUARDIAN_ACTION_BASE  = 100,
+    GUARDIAN_ACTION_CLOSE = 199
 };
 
 // Guardian archetypes
@@ -75,15 +97,43 @@ static const char* ArchetypeName(uint8 arch)
     }
 }
 
-// Constants
-constexpr uint32 MAX_GUARDIAN_SPELLS = 8;
-constexpr float GUARDIAN_FOLLOW_DIST = 3.0f;
-constexpr float GUARDIAN_FOLLOW_ANGLE = M_PI / 2; // 90 degrees to the side
-constexpr float HEALER_FOLLOW_DIST = 12.0f;
-constexpr float HEALER_FOLLOW_ANGLE = M_PI; // Behind owner
+// ============================================================================
+// Module Configuration (before data structures so FindEmptySlot can use it)
+// ============================================================================
+
+struct CreatureCaptureConfig
+{
+    bool enabled = true;
+    bool announce = true;
+    uint32 guardianDuration = 0;
+    bool allowElite = false;
+    bool allowRare = true;
+    int32 maxLevelDiff = 5;
+    uint8 minCreatureLevel = 1;
+    uint32 healthPct = 100;
+    uint32 damagePct = 100;
+    uint8 maxSlots = 4;
+
+    void Load()
+    {
+        enabled = sConfigMgr->GetOption<bool>("CreatureCapture.Enable", true);
+        announce = sConfigMgr->GetOption<bool>("CreatureCapture.Announce", true);
+        guardianDuration = sConfigMgr->GetOption<uint32>("CreatureCapture.GuardianDuration", 0);
+        allowElite = sConfigMgr->GetOption<bool>("CreatureCapture.AllowElite", false);
+        allowRare = sConfigMgr->GetOption<bool>("CreatureCapture.AllowRare", true);
+        maxLevelDiff = sConfigMgr->GetOption<int32>("CreatureCapture.MaxLevelDiff", 5);
+        minCreatureLevel = sConfigMgr->GetOption<uint8>("CreatureCapture.MinCreatureLevel", 1);
+        healthPct = sConfigMgr->GetOption<uint32>("CreatureCapture.HealthPct", 100);
+        damagePct = sConfigMgr->GetOption<uint32>("CreatureCapture.DamagePct", 100);
+        uint8 slots = sConfigMgr->GetOption<uint8>("CreatureCapture.MaxSlots", 4);
+        maxSlots = std::max(uint8(1), std::min(uint8(MAX_GUARDIAN_SLOTS), slots));
+    }
+};
+
+static CreatureCaptureConfig config;
 
 // ============================================================================
-// Addon Message Helper
+// Addon Message Helpers (slot-aware)
 // ============================================================================
 
 static void SendCaptureAddonMessage(Player* player, std::string const& msg)
@@ -102,68 +152,126 @@ static void SendCaptureAddonMessage(Player* player, std::string const& msg)
     player->GetSession()->SendPacket(&data);
 }
 
-static void SendGuardianSpells(Player* player, uint32 const* spells)
+static void SendGuardianSpells(Player* player, uint8 slot, uint32 const* spells)
 {
     std::ostringstream ss;
-    ss << ADDON_PREFIX << "\tSPELLS";
+    ss << ADDON_PREFIX << "\tSPELLS:" << (uint32)slot;
     for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
         ss << ":" << spells[i];
     SendCaptureAddonMessage(player, ss.str());
 }
 
-static void SendGuardianArchetype(Player* player, uint8 archetype)
+static void SendGuardianArchetype(Player* player, uint8 slot, uint8 archetype)
 {
     std::ostringstream ss;
-    ss << ADDON_PREFIX << "\tARCH:" << (uint32)archetype;
+    ss << ADDON_PREFIX << "\tARCH:" << (uint32)slot << ":" << (uint32)archetype;
     SendCaptureAddonMessage(player, ss.str());
 }
 
-static void SendGuardianName(Player* player, std::string const& name)
+static void SendGuardianName(Player* player, uint8 slot, std::string const& name)
 {
     std::ostringstream ss;
-    ss << ADDON_PREFIX << "\tNAME:" << name;
+    ss << ADDON_PREFIX << "\tNAME:" << (uint32)slot << ":" << name;
     SendCaptureAddonMessage(player, ss.str());
 }
 
-static void SendGuardianDismiss(Player* player)
+static void SendGuardianDismiss(Player* player, uint8 slot)
 {
     std::ostringstream ss;
-    ss << ADDON_PREFIX << "\tDISMISS";
+    ss << ADDON_PREFIX << "\tDISMISS:" << (uint32)slot;
     SendCaptureAddonMessage(player, ss.str());
 }
 
-// Send all guardian state to the addon
-static void SendFullGuardianState(Player* player, std::string const& name, uint8 archetype, uint32 const* spells)
+static void SendGuardianGuid(Player* player, uint8 slot, ObjectGuid guid)
 {
-    SendGuardianName(player, name);
-    SendGuardianArchetype(player, archetype);
-    SendGuardianSpells(player, spells);
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tGUID:" << (uint32)slot << ":";
+    // Format as hex matching UnitGUID("target") format: 0x0000000000000000
+    ss << "0x" << std::hex << std::uppercase << std::setfill('0')
+       << std::setw(16) << guid.GetRawValue();
+    SendCaptureAddonMessage(player, ss.str());
 }
+
+static void SendGuardianClear(Player* player, uint8 slot)
+{
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tCLEAR:" << (uint32)slot;
+    SendCaptureAddonMessage(player, ss.str());
+}
+
+// Forward declarations for data types
+struct GuardianSlotData;
+class CapturedGuardianData;
+
+static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const& slotData);
+static void SendAllSlotsState(Player* player);
 
 // ============================================================================
-// Data: Stored on Player via DataMap
+// Data Structures
 // ============================================================================
+
+struct GuardianSlotData
+{
+    ObjectGuid guardianGuid;
+    uint32 guardianEntry    = 0;
+    uint8  guardianLevel    = 0;
+    uint32 guardianHealth   = 0;
+    uint32 guardianPower    = 0;
+    uint8  guardianPowerType = 0;
+    uint8  archetype        = ARCHETYPE_DPS;
+    uint32 spellSlots[MAX_GUARDIAN_SPELLS] = {};
+    uint32 displayId        = 0;
+    int8   equipmentId      = 0;
+    bool   savedToDb        = false;
+
+    void Clear()
+    {
+        guardianGuid.Clear();
+        guardianEntry = 0;
+        guardianLevel = 0;
+        guardianHealth = 0;
+        guardianPower = 0;
+        guardianPowerType = 0;
+        archetype = ARCHETYPE_DPS;
+        memset(spellSlots, 0, sizeof(spellSlots));
+        displayId = 0;
+        equipmentId = 0;
+        savedToDb = false;
+    }
+
+    bool IsOccupied() const { return guardianEntry != 0; }
+    bool IsActive()   const { return !guardianGuid.IsEmpty(); }
+};
 
 class CapturedGuardianData : public DataMap::Base
 {
 public:
-    CapturedGuardianData() : guardianGuid(), guardianEntry(0), guardianLevel(0),
-        guardianHealth(0), guardianPower(0), guardianPowerType(0),
-        archetype(ARCHETYPE_DPS), savedToDb(false)
+    GuardianSlotData slots[MAX_GUARDIAN_SLOTS];
+
+    int8 FindEmptySlot() const
     {
-        memset(spellSlots, 0, sizeof(spellSlots));
+        for (uint8 i = 0; i < config.maxSlots; ++i)
+            if (!slots[i].IsOccupied())
+                return static_cast<int8>(i);
+        return -1;
     }
 
-    ObjectGuid guardianGuid;
-    // For respawn after cross-map teleport and persistence
-    uint32 guardianEntry;
-    uint8 guardianLevel;
-    uint32 guardianHealth;
-    uint32 guardianPower;
-    uint8 guardianPowerType;
-    uint8 archetype;
-    uint32 spellSlots[MAX_GUARDIAN_SPELLS];
-    bool savedToDb;
+    int8 FindSlotByGuid(ObjectGuid guid) const
+    {
+        if (guid.IsEmpty()) return -1;
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            if (slots[i].guardianGuid == guid)
+                return static_cast<int8>(i);
+        return -1;
+    }
+
+    int8 FindSlotByEntry(uint32 entry) const
+    {
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            if (slots[i].guardianEntry == entry)
+                return static_cast<int8>(i);
+        return -1;
+    }
 };
 
 // ============================================================================
@@ -173,10 +281,11 @@ public:
 class CapturedGuardianAI : public CreatureAI
 {
 public:
-    explicit CapturedGuardianAI(Creature* creature, uint8 archetype, uint32 const* spells)
+    explicit CapturedGuardianAI(Creature* creature, uint8 archetype, uint32 const* spells, uint8 slotIndex)
         : CreatureAI(creature),
         _owner(nullptr),
         _archetype(archetype),
+        _slotIndex(slotIndex),
         _updateTimer(1000),
         _combatCheckTimer(500),
         _regenTimer(2000)
@@ -190,20 +299,28 @@ public:
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
     }
 
+    float GetFollowDist() const
+    {
+        return (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
+    }
+
+    float GetFollowAngle() const
+    {
+        return GUARDIAN_FOLLOW_ANGLES[_slotIndex % MAX_GUARDIAN_SLOTS];
+    }
+
     void SetArchetype(uint8 arch)
     {
         _archetype = arch;
-        // Adjust follow distance based on archetype
         if (_owner && !me->GetVictim())
         {
             me->GetMotionMaster()->Clear();
-            float dist = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-            float angle = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_ANGLE : GUARDIAN_FOLLOW_ANGLE;
-            me->GetMotionMaster()->MoveFollow(_owner, dist, angle);
+            me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
         }
     }
 
     uint8 GetArchetype() const { return _archetype; }
+    uint8 GetSlotIndex() const { return _slotIndex; }
 
     void SetSpell(uint32 slot, uint32 spellId)
     {
@@ -244,7 +361,7 @@ public:
             if (_owner && me->GetDistance(_owner) > 50.0f)
             {
                 float x, y, z;
-                _owner->GetClosePoint(x, y, z, me->GetCombatReach(), GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
+                _owner->GetClosePoint(x, y, z, me->GetCombatReach(), GetFollowDist(), GetFollowAngle());
                 me->NearTeleportTo(x, y, z, me->GetOrientation());
             }
         }
@@ -252,7 +369,6 @@ public:
         // In-combat behavior
         if (me->GetVictim())
         {
-            // Check if should stop attacking
             if (!me->GetVictim()->IsAlive() ||
                 !me->CanCreatureAttack(me->GetVictim()) ||
                 (_owner && me->GetDistance(_owner) > 40.0f))
@@ -260,26 +376,15 @@ public:
                 me->AttackStop();
                 me->GetMotionMaster()->Clear();
                 if (_owner)
-                {
-                    float dist = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-                    float angle = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_ANGLE : GUARDIAN_FOLLOW_ANGLE;
-                    me->GetMotionMaster()->MoveFollow(_owner, dist, angle);
-                }
+                    me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
                 return;
             }
 
-            // Archetype-specific combat
             switch (_archetype)
             {
-                case ARCHETYPE_TANK:
-                    UpdateTankAI(diff);
-                    break;
-                case ARCHETYPE_HEALER:
-                    UpdateHealerAI(diff);
-                    break;
-                default:
-                    UpdateDpsAI(diff);
-                    break;
+                case ARCHETYPE_TANK:   UpdateTankAI(diff);   break;
+                case ARCHETYPE_HEALER: UpdateHealerAI(diff); break;
+                default:               UpdateDpsAI(diff);    break;
             }
         }
         else
@@ -314,7 +419,6 @@ public:
 
                 if (_owner)
                 {
-                    // Tank: prioritize owner's attackers
                     if (_archetype == ARCHETYPE_TANK)
                     {
                         if (Unit* attacker = _owner->getAttackerForHelper())
@@ -328,7 +432,6 @@ public:
                         }
                     }
 
-                    // Check if owner is being attacked
                     if (Unit* attacker = _owner->getAttackerForHelper())
                     {
                         if (me->CanCreatureAttack(attacker))
@@ -338,7 +441,6 @@ public:
                         }
                     }
 
-                    // Check if owner is attacking something
                     if (Unit* ownerTarget = _owner->GetVictim())
                     {
                         if (me->CanCreatureAttack(ownerTarget))
@@ -348,7 +450,6 @@ public:
                         }
                     }
 
-                    // Check own attackers
                     if (!me->GetVictim())
                     {
                         for (Unit* attacker : me->getAttackers())
@@ -362,21 +463,14 @@ public:
                         }
                     }
 
-                    // Healer: also check if owner needs healing while out of combat
                     if (_archetype == ARCHETYPE_HEALER && _owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
-                    {
                         DoCastHealingSpells();
-                    }
                 }
             }
 
             // Follow owner
             if (_owner && me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
-            {
-                float dist = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-                float angle = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_ANGLE : GUARDIAN_FOLLOW_ANGLE;
-                me->GetMotionMaster()->MoveFollow(_owner, dist, angle);
-            }
+                me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
         }
 
         // Check summoned creatures — stop them from attacking the owner
@@ -456,16 +550,10 @@ public:
 
         if (me->Attack(target, true))
         {
-            // Healer stays at range
             if (_archetype == ARCHETYPE_HEALER)
-            {
-                // Don't chase — just face target and stay near owner
                 me->SetFacingToObject(target);
-            }
             else
-            {
                 me->GetMotionMaster()->MoveChase(target);
-            }
         }
     }
 
@@ -474,11 +562,7 @@ public:
         me->AttackStop();
         me->GetMotionMaster()->Clear();
         if (_owner)
-        {
-            float dist = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-            float angle = (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_ANGLE : GUARDIAN_FOLLOW_ANGLE;
-            me->GetMotionMaster()->MoveFollow(_owner, dist, angle);
-        }
+            me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
     }
 
     void JustEngagedWith(Unit* /*who*/) override { }
@@ -514,19 +598,16 @@ public:
     }
 
 private:
-    // ---- DPS archetype ----
     void UpdateDpsAI(uint32 /*diff*/)
     {
         DoMeleeAttackIfReady();
         DoCastOffensiveSpells();
     }
 
-    // ---- Tank archetype ----
     void UpdateTankAI(uint32 /*diff*/)
     {
         DoMeleeAttackIfReady();
 
-        // Generate extra threat on all nearby enemies to protect owner
         if (_owner)
         {
             for (auto const& ref : me->GetThreatMgr().GetThreatList())
@@ -534,22 +615,17 @@ private:
                 if (Unit* target = ref->getTarget())
                 {
                     if (target->GetVictim() == _owner)
-                    {
                         me->AddThreat(target, 50.0f);
-                    }
                 }
             }
         }
 
-        // Cast defensive spells on self, then offensive on target
         DoCastSelfBuffs();
         DoCastOffensiveSpells();
     }
 
-    // ---- Healer archetype ----
     void UpdateHealerAI(uint32 /*diff*/)
     {
-        // Priority: heal owner, then self, then attack
         bool healed = DoCastHealingSpells();
         if (!healed)
         {
@@ -557,8 +633,6 @@ private:
             DoCastOffensiveSpells();
         }
     }
-
-    // ---- Spell casting helpers ----
 
     void DoCastOffensiveSpells()
     {
@@ -579,19 +653,16 @@ private:
             if (!spellInfo || !spellInfo->CanBeUsedInCombat())
                 continue;
 
-            // Skip positive spells (heals/buffs) in offensive routine
             if (spellInfo->IsPositive())
                 continue;
 
             if (me->HasSpellCooldown(spellId))
                 continue;
 
-            // Check range
             if (spellInfo->GetMaxRange(false) > 0 &&
                 !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
                 continue;
 
-            // Handle periodic spells — don't reapply
             bool isPeriodic = spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
                               spellInfo->HasAura(SPELL_AURA_PERIODIC_LEECH) ||
                               spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT);
@@ -609,7 +680,6 @@ private:
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
 
-        // Find heal target: owner first, then self
         Unit* healTarget = nullptr;
         if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
             healTarget = _owner;
@@ -699,6 +769,7 @@ private:
 
     Player* _owner;
     uint8 _archetype;
+    uint8 _slotIndex;
     uint32 _spellSlots[MAX_GUARDIAN_SPELLS];
     int32 _updateTimer;
     int32 _combatCheckTimer;
@@ -708,51 +779,33 @@ private:
 };
 
 // ============================================================================
-// Module Configuration
+// Addon Message — Full state helpers (defined after data structures)
 // ============================================================================
 
-struct CreatureCaptureConfig
+static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const& slotData)
 {
-    bool enabled = true;
-    bool announce = true;
-    uint32 guardianDuration = 0;
-    bool allowElite = false;
-    bool allowRare = true;
-    int32 maxLevelDiff = 5;
-    uint8 minCreatureLevel = 1;
-    uint32 healthPct = 100;
-    uint32 damagePct = 100;
+    CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(slotData.guardianEntry);
+    std::string name = cInfo ? cInfo->Name : "Guardian";
+    SendGuardianName(player, slot, name);
+    SendGuardianArchetype(player, slot, slotData.archetype);
+    SendGuardianSpells(player, slot, slotData.spellSlots);
+    if (slotData.IsActive())
+        SendGuardianGuid(player, slot, slotData.guardianGuid);
+}
 
-    void Load()
+static void SendAllSlotsState(Player* player)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    for (uint8 i = 0; i < config.maxSlots; ++i)
     {
-        enabled = sConfigMgr->GetOption<bool>("CreatureCapture.Enable", true);
-        announce = sConfigMgr->GetOption<bool>("CreatureCapture.Announce", true);
-        guardianDuration = sConfigMgr->GetOption<uint32>("CreatureCapture.GuardianDuration", 0);
-        allowElite = sConfigMgr->GetOption<bool>("CreatureCapture.AllowElite", false);
-        allowRare = sConfigMgr->GetOption<bool>("CreatureCapture.AllowRare", true);
-        maxLevelDiff = sConfigMgr->GetOption<int32>("CreatureCapture.MaxLevelDiff", 5);
-        minCreatureLevel = sConfigMgr->GetOption<uint8>("CreatureCapture.MinCreatureLevel", 1);
-        healthPct = sConfigMgr->GetOption<uint32>("CreatureCapture.HealthPct", 100);
-        damagePct = sConfigMgr->GetOption<uint32>("CreatureCapture.DamagePct", 100);
+        if (data->slots[i].IsOccupied())
+            SendFullSlotState(player, i, data->slots[i]);
     }
-};
-
-static CreatureCaptureConfig config;
+}
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-static void DismissGuardian(Player* player)
-{
-    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-    if (data && data->guardianGuid)
-    {
-        if (Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid))
-            guardian->DespawnOrUnsummon();
-        data->guardianGuid.Clear();
-    }
-}
 
 // Serialize spell slots to comma-separated string
 static std::string SerializeSpells(uint32 const* spells)
@@ -799,64 +852,135 @@ static void PopulateDefaultSpells(uint32 creatureEntry, uint32* spells)
 }
 
 // ============================================================================
-// Database Persistence
+// Database Persistence (per-slot)
 // ============================================================================
 
-static void SaveGuardianToDb(Player* player, CapturedGuardianData* data)
+static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex)
 {
-    if (!data || data->guardianEntry == 0)
+    if (!slotData || slotData->guardianEntry == 0)
         return;
 
     uint32 ownerGuid = player->GetGUID().GetCounter();
-    std::string spellStr = SerializeSpells(data->spellSlots);
+    std::string spellStr = SerializeSpells(slotData->spellSlots);
 
     auto trans = CharacterDatabase.BeginTransaction();
-    trans->Append("DELETE FROM character_guardian WHERE owner = {}", ownerGuid);
+    trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
-        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, save_time) "
-        "VALUES ({}, {}, {}, 0, {}, {}, {}, {}, '{}', UNIX_TIMESTAMP())",
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
-        data->guardianEntry,
-        data->guardianLevel,
-        data->guardianHealth,
-        data->guardianPower,
-        data->guardianPowerType,
-        data->archetype,
-        spellStr
+        slotData->guardianEntry,
+        slotData->guardianLevel,
+        slotIndex,
+        slotData->guardianHealth,
+        slotData->guardianPower,
+        slotData->guardianPowerType,
+        slotData->archetype,
+        spellStr,
+        slotData->displayId,
+        slotData->equipmentId
     );
     CharacterDatabase.CommitTransaction(trans);
-    data->savedToDb = true;
+    slotData->savedToDb = true;
 }
 
-static void LoadGuardianFromDb(Player* player)
+static void SaveAllGuardiansToDb(Player* player)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+    {
+        if (data->slots[i].IsOccupied())
+            SaveGuardianSlotToDb(player, &data->slots[i], i);
+    }
+}
+
+static void LoadGuardiansFromDb(Player* player)
 {
     uint32 ownerGuid = player->GetGUID().GetCounter();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT entry, level, cur_health, cur_power, power_type, archetype, spells FROM character_guardian WHERE owner = {} AND slot = 0",
+        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id "
+        "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
 
     if (!result)
         return;
 
-    Field* fields = result->Fetch();
-
     CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-    data->guardianEntry = fields[0].Get<uint32>();
-    data->guardianLevel = fields[1].Get<uint8>();
-    data->guardianHealth = fields[2].Get<uint32>();
-    data->guardianPower = fields[3].Get<uint32>();
-    data->guardianPowerType = fields[4].Get<uint8>();
-    data->archetype = fields[5].Get<uint8>();
-    DeserializeSpells(fields[6].Get<std::string>(), data->spellSlots);
-    data->savedToDb = true;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint8 slot = fields[0].Get<uint8>();
+        if (slot >= MAX_GUARDIAN_SLOTS)
+            continue;
+
+        GuardianSlotData& s = data->slots[slot];
+        s.guardianEntry     = fields[1].Get<uint32>();
+        s.guardianLevel     = fields[2].Get<uint8>();
+        s.guardianHealth    = fields[3].Get<uint32>();
+        s.guardianPower     = fields[4].Get<uint32>();
+        s.guardianPowerType = fields[5].Get<uint8>();
+        s.archetype         = fields[6].Get<uint8>();
+        DeserializeSpells(fields[7].Get<std::string>(), s.spellSlots);
+        s.displayId         = fields[8].Get<uint32>();
+        s.equipmentId       = fields[9].Get<int8>();
+        s.savedToDb         = true;
+    }
+    while (result->NextRow());
 }
 
-static void DeleteGuardianFromDb(Player* player)
+static void DeleteGuardianSlotFromDb(Player* player, uint8 slotIndex)
 {
     uint32 ownerGuid = player->GetGUID().GetCounter();
-    CharacterDatabase.Execute("DELETE FROM character_guardian WHERE owner = {}", ownerGuid);
+    CharacterDatabase.Execute("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
+}
+
+// ============================================================================
+// Dismiss / Snapshot Helpers
+// ============================================================================
+
+static void SnapshotGuardianSlot(Player* player, uint8 slotIndex)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    GuardianSlotData& s = data->slots[slotIndex];
+
+    if (!s.IsActive())
+        return;
+
+    Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
+    if (!guardian)
+        return;
+
+    s.guardianEntry     = guardian->GetEntry();
+    s.guardianLevel     = guardian->GetLevel();
+    s.guardianHealth    = guardian->GetHealth();
+    s.guardianPowerType = guardian->getPowerType();
+    s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
+
+    if (CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI()))
+        memcpy(s.spellSlots, ai->GetSpells(), sizeof(s.spellSlots));
+}
+
+static void DismissGuardianSlot(Player* player, uint8 slotIndex)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    GuardianSlotData& s = data->slots[slotIndex];
+
+    if (s.IsActive())
+    {
+        if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
+            guardian->DespawnOrUnsummon();
+        s.guardianGuid.Clear();
+    }
+}
+
+static void DismissAllGuardians(Player* player)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+        DismissGuardianSlot(player, i);
 }
 
 // ============================================================================
@@ -948,13 +1072,17 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 }
 
 // ============================================================================
-// Summon Guardian
+// Summon Guardian (slot-aware)
 // ============================================================================
 
-static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype, uint32* spells)
+static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
+    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0)
 {
+    float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
+    float dist  = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
+
     float x, y, z;
-    player->GetClosePoint(x, y, z, player->GetCombatReach(), GUARDIAN_FOLLOW_DIST, GUARDIAN_FOLLOW_ANGLE);
+    player->GetClosePoint(x, y, z, player->GetCombatReach(), dist, angle);
 
     uint32 duration = config.guardianDuration > 0 ? config.guardianDuration * IN_MILLISECONDS : 0;
 
@@ -983,15 +1111,33 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->SetHealth(newHealth);
     }
 
-    // Set archetype-appropriate follow distance
-    float followDist = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-    float followAngle = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_ANGLE : GUARDIAN_FOLLOW_ANGLE;
-    guardian->GetMotionMaster()->MoveFollow(player, followDist, followAngle);
+    // Restore display model if captured with a specific one
+    if (displayId != 0)
+        guardian->SetDisplayId(displayId);
 
-    // Install our archetype-driven AI (no SmartAI delegation)
-    guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells));
+    // Restore equipment if captured with weapons
+    if (equipmentId > 0)
+        guardian->LoadEquipment(equipmentId, true);
+
+    guardian->GetMotionMaster()->MoveFollow(player, dist, angle);
+
+    // Install archetype-driven AI with slot index
+    guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex));
 
     return guardian;
+}
+
+// ============================================================================
+// Target-based slot resolution helper (for commands)
+// ============================================================================
+
+static int8 FindTargetedGuardianSlot(Player* player, CapturedGuardianData* data)
+{
+    Unit* selected = player->GetSelectedUnit();
+    if (!selected || !selected->IsCreature())
+        return -1;
+
+    return data->FindSlotByGuid(selected->GetGUID());
 }
 
 // ============================================================================
@@ -1046,41 +1192,50 @@ public:
             return true;
         }
 
-        DismissGuardian(player);
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        int8 emptySlot = data->FindEmptySlot();
+        if (emptySlot < 0)
+        {
+            handler->PSendSysMessage("All guardian slots are full. Release a guardian first.");
+            return true;
+        }
 
         uint32 entry = target->GetEntry();
         uint8 level = target->GetLevel();
         std::string name = target->GetName();
+        uint32 capturedDisplayId = target->GetDisplayId();
+        int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
 
-        // Populate default spells from creature template
         uint32 spells[MAX_GUARDIAN_SPELLS];
         PopulateDefaultSpells(entry, spells);
 
         target->DespawnOrUnsummon();
 
-        TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells);
+        TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
+            static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId);
         if (!guardian)
         {
             handler->PSendSysMessage("Failed to summon guardian.");
             return true;
         }
 
-        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        data->guardianGuid = guardian->GetGUID();
-        data->guardianEntry = entry;
-        data->guardianLevel = level;
-        data->guardianHealth = guardian->GetHealth();
-        data->guardianPowerType = guardian->getPowerType();
-        data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
-        data->archetype = ARCHETYPE_DPS;
-        memcpy(data->spellSlots, spells, sizeof(spells));
+        GuardianSlotData& s = data->slots[emptySlot];
+        s.guardianGuid      = guardian->GetGUID();
+        s.guardianEntry     = entry;
+        s.guardianLevel     = level;
+        s.guardianHealth    = guardian->GetHealth();
+        s.guardianPowerType = guardian->getPowerType();
+        s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
+        s.archetype         = ARCHETYPE_DPS;
+        s.displayId         = capturedDisplayId;
+        s.equipmentId       = capturedEquipmentId;
+        memcpy(s.spellSlots, spells, sizeof(spells));
 
-        SaveGuardianToDb(player, data);
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
 
-        handler->PSendSysMessage("You have captured {} (Level {})! It will now follow and protect you!", name, level);
+        handler->PSendSysMessage("You have captured {} (Level {}) in slot {}!", name, level, emptySlot + 1);
 
-        // Notify addon
-        SendFullGuardianState(player, name, ARCHETYPE_DPS, spells);
+        SendFullSlotState(player, static_cast<uint8>(emptySlot), s);
 
         return true;
     }
@@ -1099,9 +1254,10 @@ public:
         }
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (data->guardianGuid || data->guardianEntry != 0)
+        int8 emptySlot = data->FindEmptySlot();
+        if (emptySlot < 0)
         {
-            handler->PSendSysMessage("You already have a guardian. Dismiss or release it first.");
+            handler->PSendSysMessage("All guardian slots are full. Release a guardian first.");
             return true;
         }
 
@@ -1109,27 +1265,32 @@ public:
         uint32 spells[MAX_GUARDIAN_SPELLS];
         PopulateDefaultSpells(creatureEntry, spells);
 
-        TempSummon* guardian = SummonCapturedGuardian(player, creatureEntry, level, ARCHETYPE_DPS, spells);
+        TempSummon* guardian = SummonCapturedGuardian(player, creatureEntry, level, ARCHETYPE_DPS, spells,
+            static_cast<uint8>(emptySlot));
         if (!guardian)
         {
             handler->PSendSysMessage("Failed to summon guardian.");
             return true;
         }
 
-        data->guardianGuid = guardian->GetGUID();
-        data->guardianEntry = creatureEntry;
-        data->guardianLevel = level;
-        data->guardianHealth = guardian->GetHealth();
-        data->guardianPowerType = guardian->getPowerType();
-        data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
-        data->archetype = ARCHETYPE_DPS;
-        memcpy(data->spellSlots, spells, sizeof(spells));
+        GuardianSlotData& s = data->slots[emptySlot];
+        s.guardianGuid      = guardian->GetGUID();
+        s.guardianEntry     = creatureEntry;
+        s.guardianLevel     = level;
+        s.guardianHealth    = guardian->GetHealth();
+        s.guardianPowerType = guardian->getPowerType();
+        s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
+        s.archetype         = ARCHETYPE_DPS;
+        s.displayId         = guardian->GetDisplayId();
+        s.equipmentId       = 0;
+        memcpy(s.spellSlots, spells, sizeof(spells));
 
-        SaveGuardianToDb(player, data);
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
 
-        handler->PSendSysMessage("GM captured {} (Entry {}) at level {}.", cInfo->Name, creatureEntry, level);
+        handler->PSendSysMessage("GM captured {} (Entry {}) in slot {} at level {}.",
+            cInfo->Name, creatureEntry, emptySlot + 1, level);
 
-        SendFullGuardianState(player, cInfo->Name, ARCHETYPE_DPS, spells);
+        SendFullSlotState(player, static_cast<uint8>(emptySlot), s);
 
         return true;
     }
@@ -1141,15 +1302,27 @@ public:
             return false;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid)
+        int8 slot = FindTargetedGuardianSlot(player, data);
+
+        if (slot < 0)
         {
-            handler->PSendSysMessage("You don't have a captured guardian.");
+            handler->PSendSysMessage("Target one of your guardians to dismiss it.");
             return true;
         }
 
-        DismissGuardian(player);
-        handler->PSendSysMessage("Your guardian has been dismissed.");
-        SendGuardianDismiss(player);
+        GuardianSlotData& s = data->slots[slot];
+        if (!s.IsActive())
+        {
+            handler->PSendSysMessage("That guardian is not currently summoned.");
+            return true;
+        }
+
+        SnapshotGuardianSlot(player, static_cast<uint8>(slot));
+        DismissGuardianSlot(player, static_cast<uint8>(slot));
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(slot));
+
+        handler->PSendSysMessage("Guardian in slot {} has been dismissed.", slot + 1);
+        SendGuardianDismiss(player, static_cast<uint8>(slot));
 
         return true;
     }
@@ -1161,26 +1334,49 @@ public:
             return false;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid)
-        {
-            handler->PSendSysMessage("You don't have a captured guardian.");
-            return true;
-        }
+        int8 slot = FindTargetedGuardianSlot(player, data);
 
-        Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
-        if (!guardian)
+        if (slot >= 0)
         {
-            handler->PSendSysMessage("Your guardian could not be found.");
-            data->guardianGuid.Clear();
-            return true;
-        }
+            // Show info for targeted guardian
+            GuardianSlotData& s = data->slots[slot];
+            Creature* guardian = s.IsActive() ? ObjectAccessor::GetCreature(*player, s.guardianGuid) : nullptr;
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
+            std::string name = cInfo ? cInfo->Name : "Guardian";
 
-        handler->PSendSysMessage("=== Captured Guardian Info ===");
-        handler->PSendSysMessage("Name: {}", guardian->GetName());
-        handler->PSendSysMessage("Level: {}", guardian->GetLevel());
-        handler->PSendSysMessage("Health: {} / {}", guardian->GetHealth(), guardian->GetMaxHealth());
-        handler->PSendSysMessage("Entry: {}", guardian->GetEntry());
-        handler->PSendSysMessage("Archetype: {}", ArchetypeName(data->archetype));
+            handler->PSendSysMessage("=== Guardian Slot {} ===", slot + 1);
+            handler->PSendSysMessage("Name: {}", name);
+            handler->PSendSysMessage("Level: {}", s.guardianLevel);
+            if (guardian)
+                handler->PSendSysMessage("Health: {} / {}", guardian->GetHealth(), guardian->GetMaxHealth());
+            handler->PSendSysMessage("Entry: {}", s.guardianEntry);
+            handler->PSendSysMessage("Archetype: {}", ArchetypeName(s.archetype));
+            handler->PSendSysMessage("Status: {}", s.IsActive() ? "Active" : "Stored");
+        }
+        else
+        {
+            // Show summary of all slots
+            handler->PSendSysMessage("=== Guardian Slots ===");
+            bool anyOccupied = false;
+            for (uint8 i = 0; i < config.maxSlots; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (s.IsOccupied())
+                {
+                    CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
+                    std::string name = cInfo ? cInfo->Name : "Guardian";
+                    handler->PSendSysMessage("[{}] {} ({}) - {}",
+                        i + 1, name, ArchetypeName(s.archetype), s.IsActive() ? "Active" : "Stored");
+                    anyOccupied = true;
+                }
+                else
+                {
+                    handler->PSendSysMessage("[{}] Empty", i + 1);
+                }
+            }
+            if (!anyOccupied)
+                handler->PSendSysMessage("No guardians captured. Target a creature and use .capture!");
+        }
 
         return true;
     }
@@ -1192,9 +1388,18 @@ public:
             return false;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid)
+        int8 guardianSlot = FindTargetedGuardianSlot(player, data);
+
+        if (guardianSlot < 0)
         {
-            handler->PSendSysMessage("|cffff0000[Guardian]|r No active guardian.");
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Target one of your guardians first.");
+            return true;
+        }
+
+        GuardianSlotData& s = data->slots[guardianSlot];
+        if (!s.IsActive())
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r That guardian is not currently summoned.");
             return true;
         }
 
@@ -1204,7 +1409,7 @@ public:
             return true;
         }
 
-        Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+        Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
         if (!guardian)
         {
             handler->PSendSysMessage("|cffff0000[Guardian]|r Guardian not found.");
@@ -1219,7 +1424,6 @@ public:
         }
 
         // Check power type compatibility
-        // Allow: spells with no cost, spells costing health, and spells matching guardian's power type
         if (spellInfo->PowerType != POWER_HEALTH &&
             spellInfo->ManaCost > 0 &&
             static_cast<uint8>(spellInfo->PowerType) != guardian->getPowerType())
@@ -1237,7 +1441,6 @@ public:
             return true;
         }
 
-        // Also check ManaCostPercentage-based costs
         if (spellInfo->PowerType != POWER_HEALTH &&
             spellInfo->ManaCostPercentage > 0 &&
             static_cast<uint8>(spellInfo->PowerType) != guardian->getPowerType())
@@ -1246,22 +1449,19 @@ public:
             return true;
         }
 
-        uint32 slotIdx = slot - 1; // Convert to 0-based
+        uint32 slotIdx = slot - 1;
 
-        // Update AI
         CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI());
         if (ai)
             ai->SetSpell(slotIdx, spellId);
 
-        // Update data
-        data->spellSlots[slotIdx] = spellId;
-        SaveGuardianToDb(player, data);
+        s.spellSlots[slotIdx] = spellId;
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(guardianSlot));
 
         handler->PSendSysMessage("|cff00ff00[Guardian]|r Learned {} in slot {}.",
             spellInfo->SpellName[0], slot);
 
-        // Notify addon with updated spells
-        SendGuardianSpells(player, data->spellSlots);
+        SendGuardianSpells(player, static_cast<uint8>(guardianSlot), s.spellSlots);
 
         return true;
     }
@@ -1273,9 +1473,18 @@ public:
             return false;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid)
+        int8 guardianSlot = FindTargetedGuardianSlot(player, data);
+
+        if (guardianSlot < 0)
         {
-            handler->PSendSysMessage("|cffff0000[Guardian]|r No active guardian.");
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Target one of your guardians first.");
+            return true;
+        }
+
+        GuardianSlotData& s = data->slots[guardianSlot];
+        if (!s.IsActive())
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r That guardian is not currently summoned.");
             return true;
         }
 
@@ -1285,7 +1494,7 @@ public:
             return true;
         }
 
-        Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+        Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
         if (!guardian)
         {
             handler->PSendSysMessage("|cffff0000[Guardian]|r Guardian not found.");
@@ -1293,7 +1502,7 @@ public:
         }
 
         uint32 slotIdx = slot - 1;
-        uint32 oldSpellId = data->spellSlots[slotIdx];
+        uint32 oldSpellId = s.spellSlots[slotIdx];
 
         if (oldSpellId == 0)
         {
@@ -1304,18 +1513,16 @@ public:
         SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(oldSpellId);
         std::string spellName = spellInfo ? spellInfo->SpellName[0] : "Unknown";
 
-        // Update AI
         CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI());
         if (ai)
             ai->SetSpell(slotIdx, 0);
 
-        // Update data
-        data->spellSlots[slotIdx] = 0;
-        SaveGuardianToDb(player, data);
+        s.spellSlots[slotIdx] = 0;
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(guardianSlot));
 
         handler->PSendSysMessage("|cff00ff00[Guardian]|r Unlearned {} from slot {}.", spellName, slot);
 
-        SendGuardianSpells(player, data->spellSlots);
+        SendGuardianSpells(player, static_cast<uint8>(guardianSlot), s.spellSlots);
 
         return true;
     }
@@ -1340,7 +1547,7 @@ public:
         if (!config.enabled)
             return;
 
-        LoadGuardianFromDb(player);
+        LoadGuardiansFromDb(player);
 
         if (!player->HasItemCount(ITEM_TESSERACT, 1))
         {
@@ -1352,12 +1559,23 @@ public:
         }
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (data->guardianEntry != 0)
+        bool anyOccupied = false;
+        for (uint8 i = 0; i < config.maxSlots; ++i)
         {
-            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry);
-            std::string name = cInfo ? cInfo->Name : "Guardian";
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "|cff00ff00[Creature Capture]|r Your guardian {} is stored in the Tesseract. Use it to summon!", name);
+            if (data->slots[i].IsOccupied())
+            {
+                CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->slots[i].guardianEntry);
+                std::string name = cInfo ? cInfo->Name : "Guardian";
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Creature Capture]|r Slot {}: {} ({}) stored in Tesseract.",
+                    i + 1, name, ArchetypeName(data->slots[i].archetype));
+                anyOccupied = true;
+            }
+        }
+
+        if (anyOccupied)
+        {
+            SendAllSlotsState(player);
         }
         else if (config.announce)
         {
@@ -1370,63 +1588,52 @@ public:
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
-        if (data->guardianGuid)
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
         {
-            if (Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid))
-            {
-                data->guardianEntry = guardian->GetEntry();
-                data->guardianLevel = guardian->GetLevel();
-                data->guardianHealth = guardian->GetHealth();
-                data->guardianPowerType = guardian->getPowerType();
-                data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
-
-                // Sync spells from AI
-                if (CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI()))
-                    memcpy(data->spellSlots, ai->GetSpells(), sizeof(data->spellSlots));
-            }
+            if (data->slots[i].IsActive())
+                SnapshotGuardianSlot(player, i);
         }
 
-        if (data->guardianEntry != 0)
-            SaveGuardianToDb(player, data);
-
-        DismissGuardian(player);
+        SaveAllGuardiansToDb(player);
+        DismissAllGuardians(player);
     }
 
     bool OnPlayerBeforeTeleport(Player* player, uint32 mapId, float x, float y, float z, float /*orientation*/, uint32 /*options*/, Unit* /*target*/) override
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid)
-            return true;
-
-        Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
-        if (!guardian)
-        {
-            data->guardianGuid.Clear();
-            return true;
-        }
-
         bool sameMap = (player->GetMapId() == mapId);
 
-        if (sameMap)
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
         {
-            guardian->NearTeleportTo(x, y, z, guardian->GetOrientation());
-        }
-        else
-        {
-            data->guardianEntry = guardian->GetEntry();
-            data->guardianLevel = guardian->GetLevel();
-            data->guardianHealth = guardian->GetHealth();
-            data->guardianPowerType = guardian->getPowerType();
-            data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsActive())
+                continue;
 
-            // Preserve spells from AI
-            if (CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI()))
-                memcpy(data->spellSlots, ai->GetSpells(), sizeof(data->spellSlots));
+            Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
+            if (!guardian)
+            {
+                s.guardianGuid.Clear();
+                continue;
+            }
 
-            guardian->DespawnOrUnsummon();
-            data->guardianGuid.Clear();
+            if (sameMap)
+            {
+                // Same map: teleport guardian to new position with staggered angle
+                float angle = GUARDIAN_FOLLOW_ANGLES[i % MAX_GUARDIAN_SLOTS];
+                float dist  = (s.archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
+                float gx = x + dist * std::cos(angle);
+                float gy = y + dist * std::sin(angle);
+                guardian->NearTeleportTo(gx, gy, z, guardian->GetOrientation());
+            }
+            else
+            {
+                // Cross-map: snapshot, despawn, clear GUID
+                SnapshotGuardianSlot(player, i);
+                guardian->DespawnOrUnsummon();
+                s.guardianGuid.Clear();
 
-            SendGuardianDismiss(player);
+                SendGuardianDismiss(player, i);
+            }
         }
 
         return true;
@@ -1436,19 +1643,25 @@ public:
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
-        if (data->guardianEntry && !data->guardianGuid)
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
         {
-            TempSummon* guardian = SummonCapturedGuardian(player, data->guardianEntry, data->guardianLevel, data->archetype, data->spellSlots);
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsOccupied() || s.IsActive())
+                continue;
+
+            // Re-summon with full state
+            TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
+                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId);
             if (guardian)
             {
-                if (data->guardianHealth > 0 && data->guardianHealth <= guardian->GetMaxHealth())
-                    guardian->SetHealth(data->guardianHealth);
-                if (data->guardianPower > 0)
-                    guardian->SetPower(Powers(data->guardianPowerType), data->guardianPower);
+                if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
+                    guardian->SetHealth(s.guardianHealth);
+                if (s.guardianPower > 0)
+                    guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
-                data->guardianGuid = guardian->GetGUID();
+                s.guardianGuid = guardian->GetGUID();
 
-                SendFullGuardianState(player, guardian->GetName(), data->archetype, data->spellSlots);
+                SendFullSlotState(player, i, s);
             }
         }
     }
@@ -1470,7 +1683,7 @@ public:
 };
 
 // ============================================================================
-// Tesseract Item Script
+// Tesseract Item Script (multi-slot gossip)
 // ============================================================================
 
 class TesseractItemScript : public ItemScript
@@ -1485,99 +1698,121 @@ public:
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
-        bool hasActiveGuardian = false;
-        Creature* guardian = nullptr;
-
-        if (data->guardianGuid)
-        {
-            guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
-            if (guardian && guardian->IsAlive())
-                hasActiveGuardian = true;
-        }
-
-        bool hasStoredGuardian = (data->guardianEntry != 0);
-
+        // Check if targeting a capturable creature
         Creature* target = ObjectAccessor::GetCreatureOrPetOrVehicle(*player, player->GetTarget());
-
-        // Direct capture if targeting a creature and no guardian
-        if (target && !hasActiveGuardian && !hasStoredGuardian)
+        if (target)
         {
             std::string error;
             if (CanCaptureCreature(player, target, error))
             {
-                uint32 entry = target->GetEntry();
-                uint8 level = target->GetLevel();
-
-                uint32 spells[MAX_GUARDIAN_SPELLS];
-                PopulateDefaultSpells(entry, spells);
-
-                target->DespawnOrUnsummon();
-
-                TempSummon* newGuardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells);
-                if (newGuardian)
+                int8 emptySlot = data->FindEmptySlot();
+                if (emptySlot >= 0)
                 {
-                    data->guardianGuid = newGuardian->GetGUID();
-                    data->guardianEntry = entry;
-                    data->guardianLevel = level;
-                    data->guardianHealth = newGuardian->GetHealth();
-                    data->guardianPowerType = newGuardian->getPowerType();
-                    data->guardianPower = newGuardian->GetPower(Powers(data->guardianPowerType));
-                    data->archetype = ARCHETYPE_DPS;
-                    memcpy(data->spellSlots, spells, sizeof(spells));
+                    // Auto-capture into first empty slot
+                    uint32 entry = target->GetEntry();
+                    uint8 level = target->GetLevel();
+                    uint32 capturedDisplayId = target->GetDisplayId();
+                    int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
 
-                    SaveGuardianToDb(player, data);
+                    uint32 spells[MAX_GUARDIAN_SPELLS];
+                    PopulateDefaultSpells(entry, spells);
 
-                    ChatHandler(player->GetSession()).PSendSysMessage(
-                        "|cff00ff00[Tesseract]|r {} has been captured!", newGuardian->GetName());
+                    target->DespawnOrUnsummon();
 
-                    SendFullGuardianState(player, newGuardian->GetName(), ARCHETYPE_DPS, spells);
+                    TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
+                        static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId);
+                    if (guardian)
+                    {
+                        GuardianSlotData& s = data->slots[emptySlot];
+                        s.guardianGuid      = guardian->GetGUID();
+                        s.guardianEntry     = entry;
+                        s.guardianLevel     = level;
+                        s.guardianHealth    = guardian->GetHealth();
+                        s.guardianPowerType = guardian->getPowerType();
+                        s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
+                        s.archetype         = ARCHETYPE_DPS;
+                        s.displayId         = capturedDisplayId;
+                        s.equipmentId       = capturedEquipmentId;
+                        memcpy(s.spellSlots, spells, sizeof(spells));
+
+                        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
+
+                        ChatHandler(player->GetSession()).PSendSysMessage(
+                            "|cff00ff00[Tesseract]|r {} captured in slot {}!", guardian->GetName(), emptySlot + 1);
+
+                        SendFullSlotState(player, static_cast<uint8>(emptySlot), s);
+                    }
+                    else
+                    {
+                        ChatHandler(player->GetSession()).PSendSysMessage(
+                            "|cffff0000[Tesseract]|r Failed to capture creature.");
+                    }
+                    return true;
                 }
                 else
                 {
                     ChatHandler(player->GetSession()).PSendSysMessage(
-                        "|cffff0000[Tesseract]|r Failed to capture creature.");
+                        "|cffff0000[Tesseract]|r All guardian slots are full. Release a guardian first.");
+                    // Fall through to show gossip so they can release
                 }
-                return true;
+            }
+            // If not capturable (own guardian, etc.), fall through to gossip
+        }
+
+        // Build multi-slot gossip menu
+        ClearGossipMenuFor(player);
+
+        bool anyOccupied = false;
+        for (uint8 i = 0; i < config.maxSlots; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+
+            if (!s.IsOccupied())
+                continue;
+
+            anyOccupied = true;
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
+            std::string name = cInfo ? cInfo->Name : "Guardian";
+
+            if (s.IsActive())
+            {
+                // Active guardian — clicking dismisses
+                std::string label = "[" + std::to_string(i + 1) + "] Dismiss " + name + " (" + ArchetypeName(s.archetype) + ")";
+                AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, label,
+                    GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_DISMISS);
             }
             else
             {
-                ChatHandler(player->GetSession()).PSendSysMessage("|cffff0000[Tesseract]|r {}", error);
-                return true;
+                // Stored guardian — clicking summons
+                std::string label = "[" + std::to_string(i + 1) + "] Summon " + name + " (" + ArchetypeName(s.archetype) + ")";
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, label,
+                    GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_SUMMON);
             }
         }
 
-        // Gossip menu for summon/dismiss/info
-        ClearGossipMenuFor(player);
+        // Release options (separate, with danger icon)
+        for (uint8 i = 0; i < config.maxSlots; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsOccupied())
+                continue;
 
-        if (hasActiveGuardian)
-        {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
-                "Dismiss " + std::string(guardian->GetName()),
-                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_DISMISS);
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
-                "Guardian Info",
-                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_INFO);
-            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
-                "Release Guardian (permanent)",
-                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_RELEASE);
-        }
-        else if (hasStoredGuardian)
-        {
-            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry);
+            CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
             std::string name = cInfo ? cInfo->Name : "Guardian";
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
-                "Summon " + name,
-                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_SUMMON);
-            AddGossipItemFor(player, GOSSIP_ICON_BATTLE,
-                "Release Guardian (permanent)",
-                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_RELEASE);
+            std::string label = "Release [" + std::to_string(i + 1) + "] " + name + " (permanent)";
+            AddGossipItemFor(player, GOSSIP_ICON_BATTLE, label,
+                GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_RELEASE);
         }
-        else
+
+        if (!anyOccupied)
         {
             AddGossipItemFor(player, GOSSIP_ICON_CHAT,
                 "Target a creature and use the Tesseract to capture it!",
-                GOSSIP_SENDER_MAIN, 0);
+                GOSSIP_SENDER_MAIN, TESSERACT_ACTION_CLOSE);
         }
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Nevermind",
+            GOSSIP_SENDER_MAIN, TESSERACT_ACTION_CLOSE);
 
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, item->GetGUID());
         return true;
@@ -1587,130 +1822,112 @@ public:
     {
         CloseGossipMenuFor(player);
 
+        if (action == TESSERACT_ACTION_CLOSE || action == 0)
+            return;
+
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
-        switch (action)
+        // Decode slot and action
+        uint8 slot = action / 10;
+        uint8 localAction = action % 10;
+
+        if (slot >= MAX_GUARDIAN_SLOTS)
+            return;
+
+        GuardianSlotData& s = data->slots[slot];
+
+        switch (localAction)
         {
             case TESSERACT_ACTION_SUMMON:
             {
-                if (data->guardianEntry == 0)
+                if (!s.IsOccupied())
                 {
-                    ChatHandler(player->GetSession()).PSendSysMessage("No guardian stored in Tesseract.");
+                    ChatHandler(player->GetSession()).PSendSysMessage("No guardian in slot {}.", slot + 1);
                     return;
                 }
 
-                TempSummon* guardian = SummonCapturedGuardian(player, data->guardianEntry, data->guardianLevel, data->archetype, data->spellSlots);
+                if (s.IsActive())
+                {
+                    ChatHandler(player->GetSession()).PSendSysMessage("Guardian in slot {} is already summoned.", slot + 1);
+                    return;
+                }
+
+                TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
+                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId);
                 if (guardian)
                 {
-                    if (data->guardianHealth > 0 && data->guardianHealth <= guardian->GetMaxHealth())
-                        guardian->SetHealth(data->guardianHealth);
-                    if (data->guardianPower > 0)
-                        guardian->SetPower(Powers(data->guardianPowerType), data->guardianPower);
+                    if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
+                        guardian->SetHealth(s.guardianHealth);
+                    if (s.guardianPower > 0)
+                        guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
-                    data->guardianGuid = guardian->GetGUID();
+                    s.guardianGuid = guardian->GetGUID();
 
-                    ChatHandler(player->GetSession()).PSendSysMessage("|cff00ff00[Tesseract]|r {} has been summoned!",
-                        guardian->GetName());
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff00ff00[Tesseract]|r {} summoned from slot {}!", guardian->GetName(), slot + 1);
 
-                    SendFullGuardianState(player, guardian->GetName(), data->archetype, data->spellSlots);
+                    SendFullSlotState(player, slot, s);
                 }
                 else
                 {
-                    ChatHandler(player->GetSession()).PSendSysMessage("|cffff0000[Tesseract]|r Failed to summon guardian.");
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff0000[Tesseract]|r Failed to summon guardian.");
                 }
                 break;
             }
             case TESSERACT_ACTION_DISMISS:
             {
-                if (!data->guardianGuid)
+                if (!s.IsActive())
                 {
-                    ChatHandler(player->GetSession()).PSendSysMessage("No active guardian to dismiss.");
+                    ChatHandler(player->GetSession()).PSendSysMessage("No active guardian in slot {}.", slot + 1);
                     return;
                 }
 
-                Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
+                Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
                 if (guardian && guardian->IsAlive())
                 {
-                    data->guardianEntry = guardian->GetEntry();
-                    data->guardianLevel = guardian->GetLevel();
-                    data->guardianHealth = guardian->GetHealth();
-                    data->guardianPowerType = guardian->getPowerType();
-                    data->guardianPower = guardian->GetPower(Powers(data->guardianPowerType));
-
-                    if (CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI()))
-                        memcpy(data->spellSlots, ai->GetSpells(), sizeof(data->spellSlots));
-
+                    SnapshotGuardianSlot(player, slot);
                     std::string name = guardian->GetName();
-
                     guardian->DespawnOrUnsummon();
-                    data->guardianGuid.Clear();
+                    s.guardianGuid.Clear();
 
-                    SaveGuardianToDb(player, data);
+                    SaveGuardianSlotToDb(player, &s, slot);
 
-                    ChatHandler(player->GetSession()).PSendSysMessage("|cff00ff00[Tesseract]|r {} has been stored.", name);
-                    SendGuardianDismiss(player);
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cff00ff00[Tesseract]|r {} stored from slot {}.", name, slot + 1);
+                    SendGuardianDismiss(player, slot);
                 }
                 else
                 {
-                    data->guardianGuid.Clear();
+                    s.guardianGuid.Clear();
                     ChatHandler(player->GetSession()).PSendSysMessage("Guardian not found.");
-                }
-                break;
-            }
-            case TESSERACT_ACTION_INFO:
-            {
-                if (!data->guardianGuid)
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage("No active guardian.");
-                    return;
-                }
-
-                Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid);
-                if (guardian)
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage("=== Guardian Info ===");
-                    ChatHandler(player->GetSession()).PSendSysMessage("Name: {}", guardian->GetName());
-                    ChatHandler(player->GetSession()).PSendSysMessage("Level: {}", guardian->GetLevel());
-                    ChatHandler(player->GetSession()).PSendSysMessage("Health: {} / {}",
-                        guardian->GetHealth(), guardian->GetMaxHealth());
-                    ChatHandler(player->GetSession()).PSendSysMessage("Entry: {}", guardian->GetEntry());
-                    ChatHandler(player->GetSession()).PSendSysMessage("Archetype: {}", ArchetypeName(data->archetype));
                 }
                 break;
             }
             case TESSERACT_ACTION_RELEASE:
             {
                 std::string name = "Guardian";
-                if (data->guardianGuid)
+                if (s.IsActive())
                 {
-                    if (Creature* guardian = ObjectAccessor::GetCreature(*player, data->guardianGuid))
+                    if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
                     {
                         name = guardian->GetName();
                         guardian->DespawnOrUnsummon();
                     }
                 }
-                else if (data->guardianEntry)
+                else if (s.IsOccupied())
                 {
-                    if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(data->guardianEntry))
+                    if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry))
                         name = cInfo->Name;
                 }
 
-                data->guardianGuid.Clear();
-                data->guardianEntry = 0;
-                data->guardianLevel = 0;
-                data->guardianHealth = 0;
-                data->guardianPower = 0;
-                data->guardianPowerType = 0;
-                data->archetype = ARCHETYPE_DPS;
-                memset(data->spellSlots, 0, sizeof(data->spellSlots));
-                data->savedToDb = false;
-
-                DeleteGuardianFromDb(player);
+                s.Clear();
+                DeleteGuardianSlotFromDb(player, slot);
 
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    "|cffff6600[Tesseract]|r {} has been released into the wild.", name);
+                    "|cffff6600[Tesseract]|r {} released from slot {}.", name, slot + 1);
 
-                SendGuardianDismiss(player);
+                SendGuardianClear(player, slot);
                 break;
             }
             default:
@@ -1733,25 +1950,28 @@ public:
         if (!config.enabled || !player || !creature)
             return false;
 
-        // Check if this creature is the player's active guardian
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid || data->guardianGuid != creature->GetGUID())
+        int8 slot = data->FindSlotByGuid(creature->GetGUID());
+        if (slot < 0)
             return false;
 
         if (creature->GetOwnerGUID() != player->GetGUID())
             return false;
 
-        // Build the normal gossip menu first (preserves vendor/trainer/quest options)
+        // Build the normal gossip menu first
         player->PrepareGossipMenu(creature, creature->GetGossipMenuId(), true);
 
-        // Append archetype selection
-        std::string dpsLabel   = std::string("[DPS] Switch to DPS")    + (data->archetype == ARCHETYPE_DPS    ? " (active)" : "");
-        std::string tankLabel  = std::string("[Tank] Switch to Tank")  + (data->archetype == ARCHETYPE_TANK   ? " (active)" : "");
-        std::string healLabel  = std::string("[Healer] Switch to Healer") + (data->archetype == ARCHETYPE_HEALER ? " (active)" : "");
+        GuardianSlotData& s = data->slots[slot];
 
-        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, dpsLabel,  GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_ARCHETYPE_DPS);
-        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, tankLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_ARCHETYPE_TANK);
-        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, healLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_ARCHETYPE_HEALER);
+        // Append archetype selection with slot-encoded actions
+        std::string dpsLabel   = std::string("[DPS] Switch to DPS")        + (s.archetype == ARCHETYPE_DPS    ? " (active)" : "");
+        std::string tankLabel  = std::string("[Tank] Switch to Tank")      + (s.archetype == ARCHETYPE_TANK   ? " (active)" : "");
+        std::string healLabel  = std::string("[Healer] Switch to Healer")  + (s.archetype == ARCHETYPE_HEALER ? " (active)" : "");
+
+        // Encode: 100 + slot*10 + archetype
+        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, dpsLabel,  GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_DPS);
+        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, tankLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_TANK);
+        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, healLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_HEALER);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Nevermind.", GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_CLOSE);
 
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
@@ -1763,12 +1983,8 @@ public:
         if (!config.enabled || !player || !creature)
             return false;
 
-        // Only handle our actions
-        if (action < GUARDIAN_ACTION_ARCHETYPE_DPS || action > GUARDIAN_ACTION_CLOSE)
-            return false;
-
-        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-        if (!data->guardianGuid || data->guardianGuid != creature->GetGUID())
+        // Only handle our action range
+        if (action < GUARDIAN_ACTION_BASE || action > GUARDIAN_ACTION_CLOSE)
             return false;
 
         CloseGossipMenuFor(player);
@@ -1776,34 +1992,38 @@ public:
         if (action == GUARDIAN_ACTION_CLOSE)
             return true;
 
-        uint8 newArchetype;
-        switch (action)
-        {
-            case GUARDIAN_ACTION_ARCHETYPE_TANK:   newArchetype = ARCHETYPE_TANK;   break;
-            case GUARDIAN_ACTION_ARCHETYPE_HEALER: newArchetype = ARCHETYPE_HEALER; break;
-            default:                               newArchetype = ARCHETYPE_DPS;    break;
-        }
+        // Decode: slot = (action - 100) / 10, archetype = (action - 100) % 10
+        uint8 slot = (action - GUARDIAN_ACTION_BASE) / 10;
+        uint8 newArchetype = (action - GUARDIAN_ACTION_BASE) % 10;
 
-        if (data->archetype == newArchetype)
+        if (slot >= MAX_GUARDIAN_SLOTS || newArchetype > ARCHETYPE_HEALER)
+            return false;
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        GuardianSlotData& s = data->slots[slot];
+
+        if (!s.IsActive() || s.guardianGuid != creature->GetGUID())
+            return false;
+
+        if (s.archetype == newArchetype)
         {
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00[Guardian]|r Already set to {} archetype.", ArchetypeName(newArchetype));
             return true;
         }
 
-        data->archetype = newArchetype;
+        s.archetype = newArchetype;
 
-        // Update the AI
         CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(creature->AI());
         if (ai)
             ai->SetArchetype(newArchetype);
 
-        SaveGuardianToDb(player, data);
+        SaveGuardianSlotToDb(player, &s, slot);
 
         ChatHandler(player->GetSession()).PSendSysMessage(
-            "|cff00ff00[Guardian]|r Switched to {} archetype.", ArchetypeName(newArchetype));
+            "|cff00ff00[Guardian]|r Slot {} switched to {} archetype.", slot + 1, ArchetypeName(newArchetype));
 
-        SendGuardianArchetype(player, newArchetype);
+        SendGuardianArchetype(player, slot, newArchetype);
 
         return true;
     }
