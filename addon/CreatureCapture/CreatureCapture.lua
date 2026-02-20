@@ -502,7 +502,10 @@ function RefreshSpellbook()
         end
     end
 
-    spellbook:Show()
+    -- Only show if a guardian is actively selected (targeted)
+    if selectedSlot >= 0 then
+        spellbook:Show()
+    end
 end
 
 -- ============================================================================
@@ -512,7 +515,9 @@ end
 local function OnTargetChanged()
     local targetGuid = UnitGUID("target")
     if not targetGuid then
-        return  -- Keep current selection when deselecting
+        selectedSlot = -1
+        spellbook:Hide()
+        return
     end
 
     for i = 0, MAX_SLOTS - 1 do
@@ -522,10 +527,13 @@ local function OnTargetChanged()
                 selectedSlot = i
                 RefreshSpellbook()
             end
+            spellbook:Show()
             return
         end
     end
-    -- If targeting something else, keep current selection
+    -- Targeting something that isn't a guardian: hide spellbar
+    selectedSlot = -1
+    spellbook:Hide()
 end
 
 -- ============================================================================
@@ -544,11 +552,6 @@ local function ParseSpells(payload)
         g.spellSlots[i] = tonumber(parts[i + 2]) or 0
     end
     g.hasGuardian = true
-
-    -- Auto-select if no slot selected
-    if selectedSlot < 0 then
-        selectedSlot = slot
-    end
 
     RefreshSpellbook()
 end
@@ -572,10 +575,6 @@ local function ParseName(payload)
 
     guardians[slot].guardianName = name or ""
     guardians[slot].hasGuardian = true
-
-    if selectedSlot < 0 then
-        selectedSlot = slot
-    end
 
     RefreshSpellbook()
 end
