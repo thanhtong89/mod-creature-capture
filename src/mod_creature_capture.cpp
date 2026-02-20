@@ -124,6 +124,13 @@ static uint32 CalculateMaxPower(Powers powerType, uint8 level)
     }
 }
 
+// Cost in copper for switching guardian resource type (1.07^level gold)
+static uint32 CalculateResourceSwitchCost(uint8 level)
+{
+    double cost = std::pow(1.07, static_cast<double>(level));
+    return static_cast<uint32>(cost * 10000); // gold to copper
+}
+
 // ============================================================================
 // Module Configuration (before data structures so FindEmptySlot can use it)
 // ============================================================================
@@ -1404,7 +1411,7 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 // ============================================================================
 
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
-    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0)
+    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0, bool powerChosen = false)
 {
     float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
     float dist  = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
@@ -1445,13 +1452,19 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->SetHealth(newHealth);
     }
 
-    // Apply chosen power type
-    Powers pType = Powers(powerType);
-    guardian->setPowerType(pType);
-    uint32 maxPower = CalculateMaxPower(pType, level);
-    guardian->SetMaxPower(pType, maxPower);
-    // Rage starts at 0 (generated in combat), others start full
-    guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
+    // Only override power type if the player has explicitly chosen one
+    if (powerChosen)
+    {
+        Powers pType = Powers(powerType);
+        guardian->setPowerType(pType);
+        uint32 maxPower = CalculateMaxPower(pType, level);
+        // SetCreateMana is required for the spell system to validate/deduct power costs
+        if (pType == POWER_MANA)
+            guardian->SetCreateMana(maxPower);
+        guardian->SetMaxPower(pType, maxPower);
+        // Rage starts at 0 (generated in combat), others start full
+        guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
+    }
 
     // Restore display model if captured with a specific one
     if (displayId != 0)
@@ -1769,6 +1782,15 @@ public:
             return true;
         }
 
+        // Require a resource type to be chosen before teaching spells with a power cost
+        bool hasPowerCost = spellInfo->PowerType != POWER_HEALTH &&
+            (spellInfo->ManaCost > 0 || spellInfo->ManaCostPercentage > 0);
+        if (hasPowerCost && !s.powerChosen)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Choose a resource type for this guardian before teaching spells that cost resources.");
+            return true;
+        }
+
         // Check power type compatibility
         if (spellInfo->PowerType != POWER_HEALTH &&
             spellInfo->ManaCost > 0 &&
@@ -1924,12 +1946,12 @@ public:
             {
                 // Auto-summon guardians that were not explicitly dismissed
                 TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType);
+                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
                 if (guardian)
                 {
                     if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
                         guardian->SetHealth(s.guardianHealth);
-                    if (s.guardianPower > 0)
+                    if (s.powerChosen && s.guardianPower > 0)
                         guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
                     s.guardianGuid = guardian->GetGUID();
@@ -2037,9 +2059,14 @@ public:
                     guardian->SetLevel(newLevel);
 
                     // Recalculate power for new level
-                    Powers pType = Powers(s.guardianPowerType);
-                    uint32 maxPower = CalculateMaxPower(pType, newLevel);
-                    guardian->SetMaxPower(pType, maxPower);
+                    if (s.powerChosen)
+                    {
+                        Powers pType = Powers(s.guardianPowerType);
+                        uint32 maxPower = CalculateMaxPower(pType, newLevel);
+                        if (pType == POWER_MANA)
+                            guardian->SetCreateMana(maxPower);
+                        guardian->SetMaxPower(pType, maxPower);
+                    }
                 }
             }
 
@@ -2062,12 +2089,12 @@ public:
 
             // Re-summon with full state
             TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType);
+                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
             if (guardian)
             {
                 if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
                     guardian->SetHealth(s.guardianHealth);
-                if (s.guardianPower > 0)
+                if (s.powerChosen && s.guardianPower > 0)
                     guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
                 s.guardianGuid = guardian->GetGUID();
@@ -2268,12 +2295,12 @@ public:
                 s.guardianLevel = player->GetLevel();
 
                 TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId, s.guardianPowerType);
+                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
                 if (guardian)
                 {
                     if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
                         guardian->SetHealth(s.guardianHealth);
-                    if (s.guardianPower > 0)
+                    if (s.powerChosen && s.guardianPower > 0)
                         guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
 
                     s.guardianGuid = guardian->GetGUID();
@@ -2393,9 +2420,7 @@ public:
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, healLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_HEALER);
 
         // Append resource type selection
-        std::string costHint = s.powerChosen
-            ? " (costs gold)"
-            : " (free first pick)";
+        uint32 switchCostCopper = s.powerChosen ? CalculateResourceSwitchCost(s.guardianLevel) : 0;
 
         struct { uint8 power; const char* name; } resourceTypes[] = {
             { POWER_MANA,   "Mana"   },
@@ -2407,12 +2432,25 @@ public:
         for (auto const& rt : resourceTypes)
         {
             std::string label = std::string("[Resource] Switch to ") + rt.name;
-            if (s.guardianPowerType == rt.power)
+            uint32 actionId = GUARDIAN_ACTION_BASE + slot * 10 + GUARDIAN_RESOURCE_OFFSET + rt.power;
+            if (s.powerChosen && s.guardianPowerType == rt.power)
+            {
                 label += " (active)";
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, label,
+                    GOSSIP_SENDER_MAIN, actionId);
+            }
+            else if (s.powerChosen)
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, label,
+                    GOSSIP_SENDER_MAIN, actionId,
+                    "Switch this guardian's resource type?", switchCostCopper, false);
+            }
             else
-                label += costHint;
-            AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, label,
-                GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + GUARDIAN_RESOURCE_OFFSET + rt.power);
+            {
+                label += " (free first pick)";
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, label,
+                    GOSSIP_SENDER_MAIN, actionId);
+            }
         }
 
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Nevermind.", GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_CLOSE);
@@ -2453,18 +2491,17 @@ public:
         {
             uint8 newPowerType = subAction - GUARDIAN_RESOURCE_OFFSET;
 
-            if (s.guardianPowerType == newPowerType)
+            if (s.powerChosen && s.guardianPowerType == newPowerType)
             {
                 ChatHandler(player->GetSession()).PSendSysMessage(
                     "|cff00ff00[Guardian]|r Already using {}.", PowerTypeName(newPowerType));
                 return true;
             }
 
-            // Check gold cost: first pick is free, subsequent picks cost 1.07^level gold
+            // Check gold cost: first pick is free, subsequent picks cost gold
             if (s.powerChosen)
             {
-                double cost = std::pow(1.07, static_cast<double>(s.guardianLevel));
-                uint32 costCopper = static_cast<uint32>(cost * 10000); // gold to copper
+                uint32 costCopper = CalculateResourceSwitchCost(s.guardianLevel);
                 if (player->GetMoney() < costCopper)
                 {
                     uint32 goldPart = costCopper / 10000;
@@ -2494,6 +2531,8 @@ public:
             Powers pType = Powers(newPowerType);
             creature->setPowerType(pType);
             uint32 maxPower = CalculateMaxPower(pType, s.guardianLevel);
+            if (pType == POWER_MANA)
+                creature->SetCreateMana(maxPower);
             creature->SetMaxPower(pType, maxPower);
             creature->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
 
