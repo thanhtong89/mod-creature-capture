@@ -71,12 +71,15 @@ enum TesseractGossipActions
 };
 
 // Guardian gossip action encoding:
-//   encoded = 100 + slot * 10 + archetype   (archetype 0-2)
-//   decode:  slot = (encoded - 100) / 10,   archetype = (encoded - 100) % 10
+//   encoded = 100 + slot * 10 + subAction
+//   subAction 0-2 = archetype (DPS/Tank/Healer)
+//   subAction 3-6 = resource type (3=mana, 4=rage, 5=focus, 6=energy)
+//   decode:  slot = (encoded - 100) / 10, subAction = (encoded - 100) % 10
 enum GuardianGossipActions
 {
-    GUARDIAN_ACTION_BASE  = 100,
-    GUARDIAN_ACTION_CLOSE = 199
+    GUARDIAN_ACTION_BASE            = 100,
+    GUARDIAN_RESOURCE_OFFSET        = 3,   // resource subAction = 3 + powerType
+    GUARDIAN_ACTION_CLOSE           = 199
 };
 
 // Guardian archetypes
@@ -94,6 +97,30 @@ static const char* ArchetypeName(uint8 arch)
         case ARCHETYPE_TANK:   return "Tank";
         case ARCHETYPE_HEALER: return "Healer";
         default:               return "DPS";
+    }
+}
+
+static const char* PowerTypeName(uint8 powerType)
+{
+    switch (powerType)
+    {
+        case POWER_MANA:   return "Mana";
+        case POWER_RAGE:   return "Rage";
+        case POWER_FOCUS:  return "Focus";
+        case POWER_ENERGY: return "Energy";
+        default:           return "Mana";
+    }
+}
+
+static uint32 CalculateMaxPower(Powers powerType, uint8 level)
+{
+    switch (powerType)
+    {
+        case POWER_MANA:   return 800 + level * 60;   // ~800 at L1, ~5600 at L80
+        case POWER_RAGE:   return 1000;                // Always 1000 (displays as 100)
+        case POWER_FOCUS:  return 100;                 // Always 100
+        case POWER_ENERGY: return 100;                 // Always 100
+        default:           return 1000;
     }
 }
 
@@ -192,6 +219,13 @@ static void SendGuardianGuid(Player* player, uint8 slot, ObjectGuid guid)
     SendCaptureAddonMessage(player, ss.str());
 }
 
+static void SendGuardianPower(Player* player, uint8 slot, uint8 powerType)
+{
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tPOWER:" << (uint32)slot << ":" << (uint32)powerType;
+    SendCaptureAddonMessage(player, ss.str());
+}
+
 static void SendGuardianClear(Player* player, uint8 slot)
 {
     std::ostringstream ss;
@@ -222,6 +256,7 @@ struct GuardianSlotData
     uint32 spellSlots[MAX_GUARDIAN_SPELLS] = {};
     uint32 displayId        = 0;
     int8   equipmentId      = 0;
+    bool   powerChosen      = false;
     bool   dismissed        = false;
     bool   savedToDb        = false;
 
@@ -237,6 +272,7 @@ struct GuardianSlotData
         memset(spellSlots, 0, sizeof(spellSlots));
         displayId = 0;
         equipmentId = 0;
+        powerChosen = false;
         dismissed = false;
         savedToDb = false;
     }
@@ -407,12 +443,41 @@ public:
                     me->SetHealth(std::min(me->GetHealth() + regenAmount, me->GetMaxHealth()));
                 }
 
-                if (me->GetMaxPower(POWER_MANA) > 0 && me->GetPower(POWER_MANA) < me->GetMaxPower(POWER_MANA))
+                // Power regen based on type
+                Powers pType = me->getPowerType();
+                switch (pType)
                 {
-                    uint32 manaRegen = me->GetMaxPower(POWER_MANA) * 6 / 100;
-                    if (manaRegen < 1) manaRegen = 1;
-                    me->SetPower(POWER_MANA, std::min(me->GetPower(POWER_MANA) + static_cast<int32>(manaRegen),
-                                                       me->GetMaxPower(POWER_MANA)));
+                    case POWER_MANA:
+                        if (me->GetMaxPower(POWER_MANA) > 0 && me->GetPower(POWER_MANA) < me->GetMaxPower(POWER_MANA))
+                        {
+                            uint32 manaRegen = me->GetMaxPower(POWER_MANA) * 6 / 100;
+                            if (manaRegen < 1) manaRegen = 1;
+                            me->SetPower(POWER_MANA, std::min(me->GetPower(POWER_MANA) + static_cast<int32>(manaRegen),
+                                                               me->GetMaxPower(POWER_MANA)));
+                        }
+                        break;
+                    case POWER_RAGE:
+                        // Decay 2 rage per tick out of combat (like players)
+                        if (me->GetPower(POWER_RAGE) > 0)
+                        {
+                            int32 newRage = me->GetPower(POWER_RAGE) - 20; // 20 = 2.0 rage in internal units
+                            me->SetPower(POWER_RAGE, std::max(0, newRage));
+                        }
+                        break;
+                    case POWER_ENERGY:
+                        // Regen 20 energy per 2s (like rogues)
+                        if (me->GetPower(POWER_ENERGY) < me->GetMaxPower(POWER_ENERGY))
+                            me->SetPower(POWER_ENERGY, std::min(me->GetPower(POWER_ENERGY) + 20,
+                                                                 me->GetMaxPower(POWER_ENERGY)));
+                        break;
+                    case POWER_FOCUS:
+                        // Regen 5 focus per 2s (like hunter pets)
+                        if (me->GetPower(POWER_FOCUS) < me->GetMaxPower(POWER_FOCUS))
+                            me->SetPower(POWER_FOCUS, std::min(me->GetPower(POWER_FOCUS) + 5,
+                                                                me->GetMaxPower(POWER_FOCUS)));
+                        break;
+                    default:
+                        break;
                 }
             }
 
@@ -1047,6 +1112,7 @@ static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const
     SendGuardianName(player, slot, name);
     SendGuardianArchetype(player, slot, slotData.archetype);
     SendGuardianSpells(player, slot, slotData.spellSlots);
+    SendGuardianPower(player, slot, slotData.guardianPowerType);
     if (slotData.IsActive())
         SendGuardianGuid(player, slot, slotData.guardianGuid);
 }
@@ -1124,8 +1190,8 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
     auto trans = CharacterDatabase.BeginTransaction();
     trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
-        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, dismissed, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, UNIX_TIMESTAMP())",
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, dismissed, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1137,6 +1203,7 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         spellStr,
         slotData->displayId,
         slotData->equipmentId,
+        slotData->powerChosen ? 1 : 0,
         slotData->dismissed ? 1 : 0
     );
     CharacterDatabase.CommitTransaction(trans);
@@ -1158,7 +1225,7 @@ static void LoadGuardiansFromDb(Player* player)
     uint32 ownerGuid = player->GetGUID().GetCounter();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, dismissed "
+        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, dismissed "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
@@ -1185,7 +1252,8 @@ static void LoadGuardiansFromDb(Player* player)
         DeserializeSpells(fields[7].Get<std::string>(), s.spellSlots);
         s.displayId         = fields[8].Get<uint32>();
         s.equipmentId       = fields[9].Get<int8>();
-        s.dismissed         = fields[10].Get<uint8>() != 0;
+        s.powerChosen       = fields[10].Get<uint8>() != 0;
+        s.dismissed         = fields[11].Get<uint8>() != 0;
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -1336,7 +1404,7 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 // ============================================================================
 
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
-    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0)
+    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0)
 {
     float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
     float dist  = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
@@ -1376,6 +1444,14 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->SetMaxHealth(newHealth);
         guardian->SetHealth(newHealth);
     }
+
+    // Apply chosen power type
+    Powers pType = Powers(powerType);
+    guardian->setPowerType(pType);
+    uint32 maxPower = CalculateMaxPower(pType, level);
+    guardian->SetMaxPower(pType, maxPower);
+    // Rage starts at 0 (generated in combat), others start full
+    guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
 
     // Restore display model if captured with a specific one
     if (displayId != 0)
@@ -1467,10 +1543,11 @@ public:
         }
 
         uint32 entry = target->GetEntry();
-        uint8 level = target->GetLevel();
+        uint8 level = player->GetLevel();
         std::string name = target->GetName();
         uint32 capturedDisplayId = target->GetDisplayId();
         int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
+        uint8 capturedPowerType = target->getPowerType();
 
         uint32 spells[MAX_GUARDIAN_SPELLS];
         PopulateDefaultSpells(entry, spells);
@@ -1478,7 +1555,7 @@ public:
         target->DespawnOrUnsummon();
 
         TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
-            static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId);
+            static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId, capturedPowerType);
         if (!guardian)
         {
             handler->PSendSysMessage("Failed to summon guardian.");
@@ -1618,6 +1695,8 @@ public:
                 handler->PSendSysMessage("Health: {} / {}", guardian->GetHealth(), guardian->GetMaxHealth());
             handler->PSendSysMessage("Entry: {}", s.guardianEntry);
             handler->PSendSysMessage("Archetype: {}", ArchetypeName(s.archetype));
+            handler->PSendSysMessage("Resource: {} ({})", PowerTypeName(s.guardianPowerType),
+                s.powerChosen ? "chosen" : "default");
             handler->PSendSysMessage("Status: {}", s.IsActive() ? "Active" : "Stored");
         }
         else
@@ -1806,7 +1885,8 @@ public:
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_ON_BEFORE_TELEPORT,
-        PLAYERHOOK_ON_MAP_CHANGED
+        PLAYERHOOK_ON_MAP_CHANGED,
+        PLAYERHOOK_ON_LEVEL_CHANGED
     }) {}
 
     void OnPlayerLogin(Player* player) override
@@ -1837,11 +1917,14 @@ public:
             CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
             std::string name = cInfo ? cInfo->Name : "Guardian";
 
+            // Sync guardian level with player level
+            s.guardianLevel = player->GetLevel();
+
             if (!s.dismissed)
             {
                 // Auto-summon guardians that were not explicitly dismissed
                 TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId);
+                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType);
                 if (guardian)
                 {
                     if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
@@ -1930,6 +2013,40 @@ public:
         return true;
     }
 
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
+    {
+        if (!config.enabled)
+            return;
+
+        uint8 newLevel = player->GetLevel();
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsOccupied())
+                continue;
+
+            s.guardianLevel = newLevel;
+
+            if (s.IsActive())
+            {
+                Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
+                if (guardian && guardian->IsAlive())
+                {
+                    guardian->SetLevel(newLevel);
+
+                    // Recalculate power for new level
+                    Powers pType = Powers(s.guardianPowerType);
+                    uint32 maxPower = CalculateMaxPower(pType, newLevel);
+                    guardian->SetMaxPower(pType, maxPower);
+                }
+            }
+
+            SaveGuardianSlotToDb(player, &s, i);
+        }
+    }
+
     void OnPlayerMapChanged(Player* player) override
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
@@ -1940,9 +2057,12 @@ public:
             if (!s.IsOccupied() || s.IsActive())
                 continue;
 
+            // Sync level with player
+            s.guardianLevel = player->GetLevel();
+
             // Re-summon with full state
             TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId);
+                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType);
             if (guardian)
             {
                 if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
@@ -2001,9 +2121,10 @@ public:
                 {
                     // Auto-capture into first empty slot
                     uint32 entry = target->GetEntry();
-                    uint8 level = target->GetLevel();
+                    uint8 level = player->GetLevel();
                     uint32 capturedDisplayId = target->GetDisplayId();
                     int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
+                    uint8 capturedPowerType = target->getPowerType();
 
                     uint32 spells[MAX_GUARDIAN_SPELLS];
                     PopulateDefaultSpells(entry, spells);
@@ -2011,7 +2132,7 @@ public:
                     target->DespawnOrUnsummon();
 
                     TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
-                        static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId);
+                        static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId, capturedPowerType);
                     if (guardian)
                     {
                         GuardianSlotData& s = data->slots[emptySlot];
@@ -2143,8 +2264,11 @@ public:
                     return;
                 }
 
+                // Sync level with player
+                s.guardianLevel = player->GetLevel();
+
                 TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId);
+                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId, s.guardianPowerType);
                 if (guardian)
                 {
                     if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
@@ -2263,10 +2387,34 @@ public:
         std::string tankLabel  = std::string("[Tank] Switch to Tank")      + (s.archetype == ARCHETYPE_TANK   ? " (active)" : "");
         std::string healLabel  = std::string("[Healer] Switch to Healer")  + (s.archetype == ARCHETYPE_HEALER ? " (active)" : "");
 
-        // Encode: 100 + slot*10 + archetype
+        // Encode: 100 + slot*10 + subAction
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, dpsLabel,  GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_DPS);
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, tankLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_TANK);
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, healLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_HEALER);
+
+        // Append resource type selection
+        std::string costHint = s.powerChosen
+            ? " (costs gold)"
+            : " (free first pick)";
+
+        struct { uint8 power; const char* name; } resourceTypes[] = {
+            { POWER_MANA,   "Mana"   },
+            { POWER_RAGE,   "Rage"   },
+            { POWER_FOCUS,  "Focus"  },
+            { POWER_ENERGY, "Energy" },
+        };
+
+        for (auto const& rt : resourceTypes)
+        {
+            std::string label = std::string("[Resource] Switch to ") + rt.name;
+            if (s.guardianPowerType == rt.power)
+                label += " (active)";
+            else
+                label += costHint;
+            AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, label,
+                GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + GUARDIAN_RESOURCE_OFFSET + rt.power);
+        }
+
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Nevermind.", GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_CLOSE);
 
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
@@ -2287,11 +2435,11 @@ public:
         if (action == GUARDIAN_ACTION_CLOSE)
             return true;
 
-        // Decode: slot = (action - 100) / 10, archetype = (action - 100) % 10
+        // Decode: slot = (action - 100) / 10, subAction = (action - 100) % 10
         uint8 slot = (action - GUARDIAN_ACTION_BASE) / 10;
-        uint8 newArchetype = (action - GUARDIAN_ACTION_BASE) % 10;
+        uint8 subAction = (action - GUARDIAN_ACTION_BASE) % 10;
 
-        if (slot >= MAX_GUARDIAN_SLOTS || newArchetype > ARCHETYPE_HEALER)
+        if (slot >= MAX_GUARDIAN_SLOTS)
             return false;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
@@ -2299,6 +2447,67 @@ public:
 
         if (!s.IsActive() || s.guardianGuid != creature->GetGUID())
             return false;
+
+        // Resource type change (subAction 3-6)
+        if (subAction >= GUARDIAN_RESOURCE_OFFSET && subAction <= GUARDIAN_RESOURCE_OFFSET + 3)
+        {
+            uint8 newPowerType = subAction - GUARDIAN_RESOURCE_OFFSET;
+
+            if (s.guardianPowerType == newPowerType)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Guardian]|r Already using {}.", PowerTypeName(newPowerType));
+                return true;
+            }
+
+            // Check gold cost: first pick is free, subsequent picks cost 1.07^level gold
+            if (s.powerChosen)
+            {
+                double cost = std::pow(1.07, static_cast<double>(s.guardianLevel));
+                uint32 costCopper = static_cast<uint32>(cost * 10000); // gold to copper
+                if (player->GetMoney() < costCopper)
+                {
+                    uint32 goldPart = costCopper / 10000;
+                    uint32 silverPart = (costCopper % 10000) / 100;
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff0000[Guardian]|r Not enough gold. Cost: {}g {}s.", goldPart, silverPart);
+                    return true;
+                }
+                player->ModifyMoney(-static_cast<int32>(costCopper));
+
+                uint32 goldPart = costCopper / 10000;
+                uint32 silverPart = (costCopper % 10000) / 100;
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Guardian]|r Switched to {} for {}g {}s.",
+                    PowerTypeName(newPowerType), goldPart, silverPart);
+            }
+            else
+            {
+                s.powerChosen = true;
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Guardian]|r Switched to {} (free first pick).", PowerTypeName(newPowerType));
+            }
+
+            s.guardianPowerType = newPowerType;
+
+            // Apply to live creature
+            Powers pType = Powers(newPowerType);
+            creature->setPowerType(pType);
+            uint32 maxPower = CalculateMaxPower(pType, s.guardianLevel);
+            creature->SetMaxPower(pType, maxPower);
+            creature->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
+
+            SaveGuardianSlotToDb(player, &s, slot);
+            SendGuardianPower(player, slot, newPowerType);
+
+            return true;
+        }
+
+        // Archetype change (subAction 0-2)
+        if (subAction > ARCHETYPE_HEALER)
+            return false;
+
+        uint8 newArchetype = subAction;
 
         if (s.archetype == newArchetype)
         {
