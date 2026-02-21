@@ -126,6 +126,13 @@ static uint32 CalculateMaxPower(Powers powerType, uint8 level)
     }
 }
 
+// Base mana used for ManaCostPercentage calculation (mirrors player base mana).
+// Kept lower than MaxPower so percentage-based spell costs stay reasonable.
+static uint32 CalculateBaseMana(uint8 level)
+{
+    return 200 + level * 15;  // ~200 at L1, ~1400 at L80
+}
+
 // Cost in copper for switching guardian resource type (1.07^level gold)
 static uint32 CalculateResourceSwitchCost(uint8 level)
 {
@@ -342,6 +349,21 @@ public:
         else
             memset(_spellSlots, 0, sizeof(_spellSlots));
 
+        // Detect if any taught spell is a taunt
+        _hasTauntSpell = false;
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            if (_spellSlots[i])
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(_spellSlots[i]);
+                if (si && si->HasAura(SPELL_AURA_MOD_TAUNT))
+                {
+                    _hasTauntSpell = true;
+                    break;
+                }
+            }
+        }
+
         if (ObjectGuid ownerGuid = me->GetOwnerGUID())
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
     }
@@ -376,6 +398,21 @@ public:
 
         if (spellId)
             EquipFallbackWeaponForSpell(spellId);
+
+        // Re-scan for taunt spells
+        _hasTauntSpell = false;
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            if (_spellSlots[i])
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(_spellSlots[i]);
+                if (si && si->HasAura(SPELL_AURA_MOD_TAUNT))
+                {
+                    _hasTauntSpell = true;
+                    break;
+                }
+            }
+        }
     }
 
     uint32 GetSpell(uint32 slot) const
@@ -392,6 +429,8 @@ public:
 
         if (_helpCryTimer > 0)
             _helpCryTimer -= diff;
+        if (_tauntTimer > 0)
+            _tauntTimer -= diff;
 
         // Update owner reference
         _updateTimer -= diff;
@@ -529,7 +568,6 @@ public:
                     }
                     else
                     {
-                        // Non-healer archetypes: original behavior
                         if (_archetype == ARCHETYPE_TANK)
                         {
                             if (Unit* attacker = _owner->getAttackerForHelper())
@@ -825,41 +863,57 @@ private:
 
         if (_owner)
         {
-            // Collect healer guardians to protect
-            std::vector<ObjectGuid> healerGuids;
+            // Collect ally GUIDs (owner + all active guardians except self)
+            std::vector<ObjectGuid> allyGuids;
+            allyGuids.push_back(_owner->GetGUID());
+
             CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
             for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
             {
                 GuardianSlotData& s = data->slots[i];
-                if (s.IsActive() && s.guardianGuid != me->GetGUID() && s.archetype == ARCHETYPE_HEALER)
-                    healerGuids.push_back(s.guardianGuid);
+                if (s.IsActive() && s.guardianGuid != me->GetGUID())
+                    allyGuids.push_back(s.guardianGuid);
             }
 
+            // For every enemy on our threat list, check if it's attacking an ally
+            // and inject threat to pull it off them
+            Unit* tauntTarget = nullptr;
             for (auto const& ref : me->GetThreatMgr().GetThreatList())
             {
-                if (Unit* target = ref->getTarget())
+                Unit* enemy = ref->getTarget();
+                if (!enemy)
+                    continue;
+
+                Unit* enemyVictim = enemy->GetVictim();
+                if (!enemyVictim || enemyVictim == me)
+                    continue;
+
+                for (ObjectGuid const& allyGuid : allyGuids)
                 {
-                    Unit* targetVictim = target->GetVictim();
-                    if (!targetVictim)
-                        continue;
-
-                    // Protect owner
-                    if (targetVictim == _owner)
+                    if (enemyVictim->GetGUID() == allyGuid)
                     {
-                        me->AddThreat(target, 50.0f);
-                        continue;
-                    }
+                        // Inject enough threat to overtake the current top holder
+                        me->AddThreat(enemy, 100.0f);
 
-                    // Protect healer guardians
-                    for (ObjectGuid const& healerGuid : healerGuids)
-                    {
-                        if (targetVictim->GetGUID() == healerGuid)
-                        {
-                            me->AddThreat(target, 80.0f);
-                            break;
-                        }
+                        // Remember the first enemy attacking an ally for taunt
+                        if (!tauntTarget)
+                            tauntTarget = enemy;
+                        break;
                     }
                 }
+            }
+
+            // Simulated taunt: if an enemy is still attacking an ally and we have
+            // no player-taught taunt spell, force the enemy to target us periodically
+            if (tauntTarget && !_hasTauntSpell && _tauntTimer <= 0 &&
+                tauntTarget->IsCreature() && tauntTarget->CanHaveThreatList())
+            {
+                tauntTarget->TauntApply(me);
+                me->AddThreat(tauntTarget, 500.0f);
+                _tauntTimer = 8000;
+
+                // Switch to attacking the taunted target
+                AttackStart(tauntTarget);
             }
         }
 
@@ -1022,11 +1076,16 @@ private:
             if (!spellInfo)
                 continue;
 
-            bool isHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
-            if (!isHeal)
+            bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+            bool isHoT = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+            if (!isDirectHeal && !isHoT)
                 continue;
 
             if (me->HasSpellCooldown(spellId))
+                continue;
+
+            // Don't reapply HoTs that are still ticking on the target
+            if (isHoT && healTarget->HasAura(spellId, me->GetGUID()))
                 continue;
 
             me->CastSpell(healTarget, spellId, false);
@@ -1053,7 +1112,8 @@ private:
             if (!spellInfo)
                 continue;
 
-            bool isHeal = spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+            bool isHeal = spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+                          spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
             if (!spellInfo->IsPositive() || isHeal)
                 continue;
 
@@ -1103,7 +1163,9 @@ private:
             if (!spellInfo || !spellInfo->IsPositive())
                 continue;
 
-            if (spellInfo->HasEffect(SPELL_EFFECT_HEAL))
+            // Skip heals and HoTs — those are handled by DoCastHealingSpells
+            if (spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+                spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL))
                 continue;
 
             // Must have an aura component to be a buff
@@ -1223,6 +1285,8 @@ private:
     int32 _regenTimer;
     int32 _summonCheckTimer = 1000;
     int32 _helpCryTimer = 0;
+    int32 _tauntTimer = 0;
+    bool  _hasTauntSpell;
     std::vector<ObjectGuid> _summonedGuids;
 };
 
@@ -1621,7 +1685,7 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->setPowerType(pType);
         uint32 maxPower = CalculateMaxPower(pType, level);
         if (pType == POWER_MANA)
-            guardian->SetCreateMana(maxPower);
+            guardian->SetCreateMana(CalculateBaseMana(level));
         guardian->SetMaxPower(pType, maxPower);
         guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
     }
@@ -2206,7 +2270,7 @@ public:
                         Powers pType = Powers(s.guardianPowerType);
                         uint32 maxPower = CalculateMaxPower(pType, newLevel);
                         if (pType == POWER_MANA)
-                            guardian->SetCreateMana(maxPower);
+                            guardian->SetCreateMana(CalculateBaseMana(newLevel));
                         guardian->SetMaxPower(pType, maxPower);
                     }
                 }
@@ -2676,7 +2740,7 @@ public:
             creature->setPowerType(pType);
             uint32 maxPower = CalculateMaxPower(pType, s.guardianLevel);
             if (pType == POWER_MANA)
-                creature->SetCreateMana(maxPower);
+                creature->SetCreateMana(CalculateBaseMana(s.guardianLevel));
             creature->SetMaxPower(pType, maxPower);
             creature->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
 
