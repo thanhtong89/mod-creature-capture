@@ -66,8 +66,10 @@ enum TesseractGossipActions
     TESSERACT_ACTION_SUMMON  = 1,
     TESSERACT_ACTION_DISMISS = 2,
     TESSERACT_ACTION_INFO    = 3,
-    TESSERACT_ACTION_RELEASE = 4,
-    TESSERACT_ACTION_CLOSE   = 99
+    TESSERACT_ACTION_RELEASE     = 4,
+    TESSERACT_ACTION_SUMMON_ALL  = 97,
+    TESSERACT_ACTION_DISMISS_ALL = 98,
+    TESSERACT_ACTION_CLOSE       = 99
 };
 
 // Guardian gossip action encoding:
@@ -79,6 +81,7 @@ enum GuardianGossipActions
 {
     GUARDIAN_ACTION_BASE            = 100,
     GUARDIAN_RESOURCE_OFFSET        = 3,   // resource subAction = 3 + powerType
+    GUARDIAN_ACTION_DISMISS         = 198,
     GUARDIAN_ACTION_CLOSE           = 199
 };
 
@@ -1298,24 +1301,71 @@ static void SnapshotGuardianSlot(Player* player, uint8 slotIndex)
         memcpy(s.spellSlots, ai->GetSpells(), sizeof(s.spellSlots));
 }
 
-static void DismissGuardianSlot(Player* player, uint8 slotIndex)
+// Forward declaration (defined below after helper functions)
+static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
+    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0, bool powerChosen = false);
+
+// Summon a guardian from a stored slot. Syncs level, restores HP/power, updates state.
+// Returns the summoned creature, or nullptr on failure.
+static TempSummon* SummonGuardianSlot(Player* player, uint8 slotIndex, bool save = true)
 {
     CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
     GuardianSlotData& s = data->slots[slotIndex];
 
-    if (s.IsActive())
-    {
-        if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
-            guardian->DespawnOrUnsummon();
-        s.guardianGuid.Clear();
-    }
+    if (!s.IsOccupied() || s.IsActive())
+        return nullptr;
+
+    s.guardianLevel = player->GetLevel();
+
+    TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
+        s.archetype, s.spellSlots, slotIndex, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
+    if (!guardian)
+        return nullptr;
+
+    if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
+        guardian->SetHealth(s.guardianHealth);
+    if (s.powerChosen && s.guardianPower > 0)
+        guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
+
+    s.guardianGuid = guardian->GetGUID();
+    s.dismissed = false;
+
+    if (save)
+        SaveGuardianSlotToDb(player, &s, slotIndex);
+
+    SendFullSlotState(player, slotIndex, s);
+
+    return guardian;
 }
 
-static void DismissAllGuardians(Player* player)
+// Full dismiss: snapshot, despawn, mark dismissed, save, notify addon.
+// If save=false, caller is responsible for saving (e.g. bulk save on logout).
+static void DismissGuardianSlot(Player* player, uint8 slotIndex, bool save = true)
 {
     CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    GuardianSlotData& s = data->slots[slotIndex];
+
+    if (!s.IsActive())
+        return;
+
+    SnapshotGuardianSlot(player, slotIndex);
+
+    if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
+        guardian->DespawnOrUnsummon();
+
+    s.guardianGuid.Clear();
+    s.dismissed = true;
+
+    if (save)
+        SaveGuardianSlotToDb(player, &s, slotIndex);
+
+    SendGuardianDismiss(player, slotIndex);
+}
+
+static void DismissAllGuardians(Player* player, bool save = true)
+{
     for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
-        DismissGuardianSlot(player, i);
+        DismissGuardianSlot(player, i, save);
 }
 
 // ============================================================================
@@ -1411,39 +1461,44 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 // ============================================================================
 
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
-    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0, bool powerChosen = false)
+    uint32* spells, uint8 slotIndex, uint32 displayId, int8 equipmentId, uint8 powerType, bool powerChosen)
 {
+    Map* map = player->FindMap();
+    if (!map)
+        return nullptr;
+
     float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
     float dist  = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
 
     float x, y, z;
     player->GetClosePoint(x, y, z, player->GetCombatReach(), dist, angle);
 
-    uint32 duration = config.guardianDuration > 0 ? config.guardianDuration * IN_MILLISECONDS : 0;
-
-    TempSummon* guardian = player->SummonCreature(
-        entry, x, y, z, player->GetOrientation(),
-        TEMPSUMMON_MANUAL_DESPAWN, duration
-    );
-
-    if (!guardian)
+    // Manually create the TempSummon so we can set faction/owner BEFORE adding
+    // to the map.  player->SummonCreature() would send the spawn packet with the
+    // creature's original (possibly hostile) faction, causing a brief aggro sound.
+    TempSummon* guardian = new TempSummon(nullptr, player->GetGUID());
+    if (!guardian->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, player->GetPhaseMask(),
+            entry, 0, x, y, z, player->GetOrientation()))
+    {
+        delete guardian;
         return nullptr;
+    }
 
+    uint32 duration = config.guardianDuration > 0 ? config.guardianDuration * IN_MILLISECONDS : 0;
+    guardian->SetTempSummonType(TEMPSUMMON_MANUAL_DESPAWN);
+    guardian->InitStats(duration);
+    guardian->SetHomePosition(x, y, z, player->GetOrientation());
+
+    // --- Configure BEFORE adding to map (client never sees hostile version) ---
     guardian->SetOwnerGUID(player->GetGUID());
     guardian->SetCreatorGUID(player->GetGUID());
     guardian->SetFaction(player->GetFaction());
     guardian->SetLevel(level);
 
     guardian->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_ATTACKABLE_1);
-    guardian->SetFaction(player->GetFaction());
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
     guardian->SetFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP);
     guardian->SetReactState(REACT_DEFENSIVE);
-
-    // Clear any inherited threat/combat state from the creature template
-    guardian->GetThreatMgr().ClearAllThreat();
-    guardian->CombatStop(true);
-    guardian->GetMotionMaster()->Clear();
 
     if (config.healthPct != 100)
     {
@@ -1452,32 +1507,35 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->SetHealth(newHealth);
     }
 
-    // Only override power type if the player has explicitly chosen one
     if (powerChosen)
     {
         Powers pType = Powers(powerType);
         guardian->setPowerType(pType);
         uint32 maxPower = CalculateMaxPower(pType, level);
-        // SetCreateMana is required for the spell system to validate/deduct power costs
         if (pType == POWER_MANA)
             guardian->SetCreateMana(maxPower);
         guardian->SetMaxPower(pType, maxPower);
-        // Rage starts at 0 (generated in combat), others start full
         guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
     }
 
-    // Restore display model if captured with a specific one
     if (displayId != 0)
         guardian->SetDisplayId(displayId);
 
-    // Restore equipment if captured with weapons
     if (equipmentId > 0)
         guardian->LoadEquipment(equipmentId, true);
 
-    guardian->GetMotionMaster()->MoveFollow(player, dist, angle);
-
-    // Install archetype-driven AI with slot index
+    // Install AI before map addition so the original AI never runs
     guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex));
+
+    // --- Now add to map (spawn packet will have friendly faction) ---
+    if (!map->AddToMap(guardian->ToCreature()))
+    {
+        delete guardian;
+        return nullptr;
+    }
+
+    guardian->InitSummon();
+    guardian->GetMotionMaster()->MoveFollow(player, dist, angle);
 
     return guardian;
 }
@@ -1666,20 +1724,14 @@ public:
             return true;
         }
 
-        GuardianSlotData& s = data->slots[slot];
-        if (!s.IsActive())
+        if (!data->slots[slot].IsActive())
         {
             handler->PSendSysMessage("That guardian is not currently summoned.");
             return true;
         }
 
-        SnapshotGuardianSlot(player, static_cast<uint8>(slot));
         DismissGuardianSlot(player, static_cast<uint8>(slot));
-        s.dismissed = true;
-        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(slot));
-
         handler->PSendSysMessage("Guardian in slot {} has been dismissed.", slot + 1);
-        SendGuardianDismiss(player, static_cast<uint8>(slot));
 
         return true;
     }
@@ -1939,23 +1991,11 @@ public:
             CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
             std::string name = cInfo ? cInfo->Name : "Guardian";
 
-            // Sync guardian level with player level
-            s.guardianLevel = player->GetLevel();
-
             if (!s.dismissed)
             {
                 // Auto-summon guardians that were not explicitly dismissed
-                TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
-                if (guardian)
+                if (SummonGuardianSlot(player, i, false))
                 {
-                    if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
-                        guardian->SetHealth(s.guardianHealth);
-                    if (s.powerChosen && s.guardianPower > 0)
-                        guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
-
-                    s.guardianGuid = guardian->GetGUID();
-
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff00ff00[Creature Capture]|r Slot {}: {} ({}) summoned.",
                         i + 1, name, ArchetypeName(s.archetype));
@@ -1984,14 +2024,18 @@ public:
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
+        // Snapshot & despawn all active guardians, preserving their dismissed state
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
         {
-            if (data->slots[i].IsActive())
-                SnapshotGuardianSlot(player, i);
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsActive())
+                continue;
+            SnapshotGuardianSlot(player, i);
+            if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
+                guardian->DespawnOrUnsummon();
+            s.guardianGuid.Clear();
         }
-
         SaveAllGuardiansToDb(player);
-        DismissAllGuardians(player);
     }
 
     bool OnPlayerBeforeTeleport(Player* player, uint32 mapId, float x, float y, float z, float /*orientation*/, uint32 /*options*/, Unit* /*target*/) override
@@ -2023,11 +2067,10 @@ public:
             }
             else
             {
-                // Cross-map: snapshot, despawn, clear GUID
+                // Cross-map: snapshot & despawn but don't mark dismissed (will auto-resummon)
                 SnapshotGuardianSlot(player, i);
                 guardian->DespawnOrUnsummon();
                 s.guardianGuid.Clear();
-
                 SendGuardianDismiss(player, i);
             }
         }
@@ -2078,30 +2121,9 @@ public:
     {
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
+        // Re-summon guardians that were temporarily despawned for map change
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
-        {
-            GuardianSlotData& s = data->slots[i];
-            if (!s.IsOccupied() || s.IsActive())
-                continue;
-
-            // Sync level with player
-            s.guardianLevel = player->GetLevel();
-
-            // Re-summon with full state
-            TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                s.archetype, s.spellSlots, i, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
-            if (guardian)
-            {
-                if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
-                    guardian->SetHealth(s.guardianHealth);
-                if (s.powerChosen && s.guardianPower > 0)
-                    guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
-
-                s.guardianGuid = guardian->GetGUID();
-
-                SendFullSlotState(player, i, s);
-            }
-        }
+            SummonGuardianSlot(player, i, false);
     }
 };
 
@@ -2243,7 +2265,26 @@ public:
                 GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_RELEASE);
         }
 
-        if (!anyOccupied)
+        if (anyOccupied)
+        {
+            // Check if there are any stored or active guardians for bulk actions
+            bool anyStored = false, anyActive = false;
+            for (uint8 i = 0; i < config.maxSlots; ++i)
+            {
+                GuardianSlotData& sl = data->slots[i];
+                if (!sl.IsOccupied()) continue;
+                if (sl.IsActive()) anyActive = true;
+                else               anyStored = true;
+            }
+
+            if (anyStored)
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, ">> Summon All <<",
+                    GOSSIP_SENDER_MAIN, TESSERACT_ACTION_SUMMON_ALL);
+            if (anyActive)
+                AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, ">> Dismiss All <<",
+                    GOSSIP_SENDER_MAIN, TESSERACT_ACTION_DISMISS_ALL);
+        }
+        else
         {
             AddGossipItemFor(player, GOSSIP_ICON_CHAT,
                 "Target a creature and use the Tesseract to capture it!",
@@ -2265,6 +2306,28 @@ public:
             return;
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        // Handle bulk actions
+        if (action == TESSERACT_ACTION_SUMMON_ALL)
+        {
+            uint32 count = 0;
+            for (uint8 i = 0; i < config.maxSlots; ++i)
+            {
+                if (SummonGuardianSlot(player, i))
+                    ++count;
+            }
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff00ff00[Tesseract]|r Summoned {} guardian(s).", count);
+            return;
+        }
+
+        if (action == TESSERACT_ACTION_DISMISS_ALL)
+        {
+            DismissAllGuardians(player);
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff00ff00[Tesseract]|r All guardians dismissed.");
+            return;
+        }
 
         // Decode slot and action
         uint8 slot = action / 10;
@@ -2291,26 +2354,11 @@ public:
                     return;
                 }
 
-                // Sync level with player
-                s.guardianLevel = player->GetLevel();
-
-                TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-                    s.archetype, s.spellSlots, slot, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
+                TempSummon* guardian = SummonGuardianSlot(player, slot);
                 if (guardian)
                 {
-                    if (s.guardianHealth > 0 && s.guardianHealth <= guardian->GetMaxHealth())
-                        guardian->SetHealth(s.guardianHealth);
-                    if (s.powerChosen && s.guardianPower > 0)
-                        guardian->SetPower(Powers(s.guardianPowerType), s.guardianPower);
-
-                    s.guardianGuid = guardian->GetGUID();
-                    s.dismissed = false;
-
                     ChatHandler(player->GetSession()).PSendSysMessage(
                         "|cff00ff00[Tesseract]|r {} summoned from slot {}!", guardian->GetName(), slot + 1);
-
-                    SaveGuardianSlotToDb(player, &s, slot);
-                    SendFullSlotState(player, slot, s);
                 }
                 else
                 {
@@ -2327,27 +2375,9 @@ public:
                     return;
                 }
 
-                Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
-                if (guardian && guardian->IsAlive())
-                {
-                    SnapshotGuardianSlot(player, slot);
-                    std::string name = guardian->GetName();
-                    guardian->DespawnOrUnsummon();
-                    s.guardianGuid.Clear();
-                    s.dismissed = true;
-
-                    SaveGuardianSlotToDb(player, &s, slot);
-
-                    ChatHandler(player->GetSession()).PSendSysMessage(
-                        "|cff00ff00[Tesseract]|r {} stored from slot {}.", name, slot + 1);
-                    SendGuardianDismiss(player, slot);
-                }
-                else
-                {
-                    s.guardianGuid.Clear();
-                    s.dismissed = true;
-                    ChatHandler(player->GetSession()).PSendSysMessage("Guardian not found.");
-                }
+                DismissGuardianSlot(player, slot);
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Tesseract]|r Guardian stored from slot {}.", slot + 1);
                 break;
             }
             case TESSERACT_ACTION_RELEASE:
@@ -2453,6 +2483,7 @@ public:
             }
         }
 
+        AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Dismiss this guardian", GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_DISMISS);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Nevermind.", GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_CLOSE);
 
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature->GetGUID());
@@ -2472,6 +2503,20 @@ public:
 
         if (action == GUARDIAN_ACTION_CLOSE)
             return true;
+
+        if (action == GUARDIAN_ACTION_DISMISS)
+        {
+            CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            int8 slot = data->FindSlotByGuid(creature->GetGUID());
+            if (slot < 0 || !data->slots[slot].IsActive())
+                return false;
+
+            std::string name = creature->GetName();
+            DismissGuardianSlot(player, static_cast<uint8>(slot));
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff00ff00[Tesseract]|r {} stored from slot {}.", name, slot + 1);
+            return true;
+        }
 
         // Decode: slot = (action - 100) / 10, subAction = (action - 100) % 10
         uint8 slot = (action - GUARDIAN_ACTION_BASE) / 10;
