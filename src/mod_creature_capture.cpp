@@ -44,9 +44,8 @@ static constexpr char ADDON_PREFIX[] = "CCAPTURE";
 constexpr uint32 MAX_GUARDIAN_SLOTS  = 4;
 constexpr uint32 MAX_GUARDIAN_SPELLS = 8;
 
-// Follow distances
+// Follow distance
 constexpr float GUARDIAN_FOLLOW_DIST = 3.0f;
-constexpr float HEALER_FOLLOW_DIST   = 12.0f;
 
 // Follow angles per slot (spread around player)
 // Slot 0: front-right (~45deg), Slot 1: back-right (~135deg),
@@ -349,7 +348,7 @@ public:
 
     float GetFollowDist() const
     {
-        return (_archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
+        return GUARDIAN_FOLLOW_DIST;
     }
 
     float GetFollowAngle() const
@@ -390,6 +389,9 @@ public:
     {
         if (!me->IsAlive())
             return;
+
+        if (_helpCryTimer > 0)
+            _helpCryTimer -= diff;
 
         // Update owner reference
         _updateTimer -= diff;
@@ -499,64 +501,91 @@ public:
 
                 if (_owner)
                 {
-                    if (_archetype == ARCHETYPE_TANK)
+                    if (_archetype == ARCHETYPE_HEALER)
                     {
+                        // Healer: only engage owner's attacker or owner's target
+                        // if another guardian is already tanking it
+                        if (Unit* attacker = _owner->getAttackerForHelper())
+                        {
+                            if (me->CanCreatureAttack(attacker) && HasEstablishedTank(attacker))
+                            {
+                                AttackStart(attacker);
+                                return;
+                            }
+                        }
+
+                        if (Unit* ownerTarget = _owner->GetVictim())
+                        {
+                            if (me->CanCreatureAttack(ownerTarget) && HasEstablishedTank(ownerTarget))
+                            {
+                                AttackStart(ownerTarget);
+                                return;
+                            }
+                        }
+
+                        // Healer: heal out of combat if owner is hurt
+                        if (_owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
+                            DoCastHealingSpells();
+                    }
+                    else
+                    {
+                        // Non-healer archetypes: original behavior
+                        if (_archetype == ARCHETYPE_TANK)
+                        {
+                            if (Unit* attacker = _owner->getAttackerForHelper())
+                            {
+                                if (me->CanCreatureAttack(attacker))
+                                {
+                                    me->AddThreat(attacker, 200.0f);
+                                    AttackStart(attacker);
+                                    return;
+                                }
+                            }
+                        }
+
                         if (Unit* attacker = _owner->getAttackerForHelper())
                         {
                             if (me->CanCreatureAttack(attacker))
                             {
-                                me->AddThreat(attacker, 200.0f);
                                 AttackStart(attacker);
                                 return;
                             }
                         }
-                    }
 
-                    if (Unit* attacker = _owner->getAttackerForHelper())
-                    {
-                        if (me->CanCreatureAttack(attacker))
+                        if (Unit* ownerTarget = _owner->GetVictim())
                         {
-                            AttackStart(attacker);
-                            return;
-                        }
-                    }
-
-                    if (Unit* ownerTarget = _owner->GetVictim())
-                    {
-                        if (me->CanCreatureAttack(ownerTarget))
-                        {
-                            AttackStart(ownerTarget);
-                            return;
-                        }
-                    }
-
-                    // Defend fellow guardians being attacked
-                    if (!me->GetVictim())
-                    {
-                        Unit* allyAttacker = FindAllyAttacker();
-                        if (allyAttacker)
-                        {
-                            AttackStart(allyAttacker);
-                            return;
-                        }
-                    }
-
-                    // Defend self from attackers
-                    if (!me->GetVictim())
-                    {
-                        for (Unit* attacker : me->getAttackers())
-                        {
-                            if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                            if (me->CanCreatureAttack(ownerTarget))
                             {
-                                me->AddThreat(attacker, 100.0f);
-                                AttackStart(attacker);
+                                AttackStart(ownerTarget);
                                 return;
                             }
                         }
-                    }
 
-                    if (_archetype == ARCHETYPE_HEALER && _owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
-                        DoCastHealingSpells();
+                        // Defend fellow guardians being attacked
+                        if (!me->GetVictim())
+                        {
+                            Unit* allyAttacker = FindAllyAttacker();
+                            if (allyAttacker)
+                            {
+                                AttackStart(allyAttacker);
+                                return;
+                            }
+                        }
+
+                        // Defend self from attackers
+                        if (!me->GetVictim())
+                        {
+                            for (Unit* attacker : me->getAttackers())
+                            {
+                                if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                                {
+                                    me->AddThreat(attacker, 100.0f);
+                                    AttackStart(attacker);
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -634,6 +663,10 @@ public:
         if (!target || !me->CanCreatureAttack(target))
             return;
 
+        // Healer refuses to engage unless someone else is already tanking
+        if (_archetype == ARCHETYPE_HEALER && !HasEstablishedTank(target))
+            return;
+
         if (!me->IsInCombat())
         {
             me->SetInCombatWith(target);
@@ -666,7 +699,14 @@ public:
 
     void SpellHit(Unit* /*caster*/, SpellInfo const* /*spellInfo*/) override { }
 
-    void DamageTaken(Unit* /*attacker*/, uint32& /*damage*/, DamageEffectType /*damageType*/, SpellSchoolMask /*schoolMask*/) override { }
+    void DamageTaken(Unit* /*attacker*/, uint32& /*damage*/, DamageEffectType /*damageType*/, SpellSchoolMask /*schoolMask*/) override
+    {
+        if (_archetype == ARCHETYPE_HEALER && _helpCryTimer <= 0)
+        {
+            me->Say("I'm under attack!", LANG_UNIVERSAL);
+            _helpCryTimer = 10000;
+        }
+    }
 
     void DamageDealt(Unit* victim, uint32& /*damage*/, DamageEffectType /*damageType*/, SpellSchoolMask /*damageSchoolMask*/) override
     {
@@ -685,6 +725,35 @@ public:
     }
 
 private:
+    // Check if the target has established threat from the owner or any friendly combatant.
+    // Only called on targets already known to be owner-related, so just verify
+    // someone is actively tanking (has meaningful threat on the target's threat list).
+    bool HasEstablishedTank(Unit* target)
+    {
+        if (!target || !target->IsCreature())
+            return false;
+
+        auto const& threatList = target->ToCreature()->GetThreatMgr().GetThreatList();
+        if (threatList.empty())
+            return false;
+
+        // Top threat holder has established aggro — healer is safe to assist
+        HostileReference* topRef = threatList.front();
+        return topRef && topRef->getTarget() && topRef->getTarget() != me &&
+               topRef->GetThreat() > 0.0f;
+    }
+
+    // Check if a spell has zero power cost
+    bool IsFreeCostSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo)
+            return false;
+
+        return spellInfo->ManaCost == 0 &&
+               spellInfo->ManaCostPercentage == 0 &&
+               spellInfo->ManaCostPerlevel == 0;
+    }
+
     // Find an enemy attacking any fellow guardian
     Unit* FindAllyAttacker()
     {
@@ -800,25 +869,25 @@ private:
 
     void UpdateHealerAI(uint32 /*diff*/)
     {
-        // Priority 1: Heal owner/self if needed
+        // Priority 1: Heal owner/self/allies if needed
         if (DoCastHealingSpells())
             return;
 
-        // Priority 2: Maintain self buffs
-        if (DoCastSelfBuffs())
+        // Priority 2: Buff allies (owner + other guardians)
+        if (DoCastAllyBuffs())
             return;
 
-        // Priority 3: Buff allies (owner + other guardians)
-        if (DoCastAllyBuffs())
+        // Priority 3: Maintain self buffs
+        if (DoCastSelfBuffs())
             return;
 
         // Priority 4: Debuff current target
         if (DoCastDebuffSpells())
             return;
 
-        // Priority 5: Offensive spells + melee
+        // Priority 5: Conservative attack — autoattack + free-cost spells only
         DoMeleeAttackIfReady();
-        DoCastOffensiveSpells();
+        DoCastFreeOffensiveSpells();
     }
 
     void DoCastOffensiveSpells()
@@ -841,6 +910,51 @@ private:
                 continue;
 
             if (spellInfo->IsPositive())
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            if (spellInfo->GetMaxRange(false) > 0 &&
+                !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                continue;
+
+            bool isPeriodic = spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
+                              spellInfo->HasAura(SPELL_AURA_PERIODIC_LEECH) ||
+                              spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT);
+            if (isPeriodic && target->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            me->CastSpell(target, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo, false);
+            break;
+        }
+    }
+
+    void DoCastFreeOffensiveSpells()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING))
+            return;
+
+        Unit* target = me->GetVictim();
+        if (!target)
+            return;
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo || !spellInfo->CanBeUsedInCombat())
+                continue;
+
+            if (spellInfo->IsPositive())
+                continue;
+
+            // Only cast spells with zero power cost
+            if (!IsFreeCostSpell(spellInfo))
                 continue;
 
             if (me->HasSpellCooldown(spellId))
@@ -1108,6 +1222,7 @@ private:
     int32 _combatCheckTimer;
     int32 _regenTimer;
     int32 _summonCheckTimer = 1000;
+    int32 _helpCryTimer = 0;
     std::vector<ObjectGuid> _summonedGuids;
 };
 
@@ -1463,33 +1578,21 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
     uint32* spells, uint8 slotIndex, uint32 displayId, int8 equipmentId, uint8 powerType, bool powerChosen)
 {
-    Map* map = player->FindMap();
-    if (!map)
-        return nullptr;
-
     float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
-    float dist  = (archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
 
     float x, y, z;
-    player->GetClosePoint(x, y, z, player->GetCombatReach(), dist, angle);
-
-    // Manually create the TempSummon so we can set faction/owner BEFORE adding
-    // to the map.  player->SummonCreature() would send the spawn packet with the
-    // creature's original (possibly hostile) faction, causing a brief aggro sound.
-    TempSummon* guardian = new TempSummon(nullptr, player->GetGUID());
-    if (!guardian->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, player->GetPhaseMask(),
-            entry, 0, x, y, z, player->GetOrientation()))
-    {
-        delete guardian;
-        return nullptr;
-    }
+    player->GetClosePoint(x, y, z, player->GetCombatReach(), GUARDIAN_FOLLOW_DIST, angle);
 
     uint32 duration = config.guardianDuration > 0 ? config.guardianDuration * IN_MILLISECONDS : 0;
-    guardian->SetTempSummonType(TEMPSUMMON_MANUAL_DESPAWN);
-    guardian->InitStats(duration);
-    guardian->SetHomePosition(x, y, z, player->GetOrientation());
 
-    // --- Configure BEFORE adding to map (client never sees hostile version) ---
+    TempSummon* guardian = player->SummonCreature(
+        entry, x, y, z, player->GetOrientation(),
+        TEMPSUMMON_MANUAL_DESPAWN, duration
+    );
+
+    if (!guardian)
+        return nullptr;
+
     guardian->SetOwnerGUID(player->GetGUID());
     guardian->SetCreatorGUID(player->GetGUID());
     guardian->SetFaction(player->GetFaction());
@@ -1499,6 +1602,11 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
     guardian->SetFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP);
     guardian->SetReactState(REACT_DEFENSIVE);
+
+    // Clear any inherited threat/combat state from the creature template
+    guardian->GetThreatMgr().ClearAllThreat();
+    guardian->CombatStop(true);
+    guardian->GetMotionMaster()->Clear();
 
     if (config.healthPct != 100)
     {
@@ -1524,18 +1632,10 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     if (equipmentId > 0)
         guardian->LoadEquipment(equipmentId, true);
 
-    // Install AI before map addition so the original AI never runs
+    guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
+
+    // Install archetype-driven AI
     guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex));
-
-    // --- Now add to map (spawn packet will have friendly faction) ---
-    if (!map->AddToMap(guardian->ToCreature()))
-    {
-        delete guardian;
-        return nullptr;
-    }
-
-    guardian->InitSummon();
-    guardian->GetMotionMaster()->MoveFollow(player, dist, angle);
 
     return guardian;
 }
@@ -2060,9 +2160,8 @@ public:
             {
                 // Same map: teleport guardian to new position with staggered angle
                 float angle = GUARDIAN_FOLLOW_ANGLES[i % MAX_GUARDIAN_SLOTS];
-                float dist  = (s.archetype == ARCHETYPE_HEALER) ? HEALER_FOLLOW_DIST : GUARDIAN_FOLLOW_DIST;
-                float gx = x + dist * std::cos(angle);
-                float gy = y + dist * std::sin(angle);
+                float gx = x + GUARDIAN_FOLLOW_DIST * std::cos(angle);
+                float gy = y + GUARDIAN_FOLLOW_DIST * std::sin(angle);
                 guardian->NearTeleportTo(gx, gy, z, guardian->GetOrientation());
             }
             else
