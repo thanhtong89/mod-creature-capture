@@ -249,6 +249,23 @@ static void SendGuardianClear(Player* player, uint8 slot)
     SendCaptureAddonMessage(player, ss.str());
 }
 
+static void SendGuardianHealthPower(Player* player, uint8 slot, uint32 curHP, uint32 maxHP, uint32 curPow, uint32 maxPow, uint8 powType)
+{
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tHPOW:" << (uint32)slot
+       << ":" << curHP << ":" << maxHP
+       << ":" << curPow << ":" << maxPow
+       << ":" << (uint32)powType;
+    SendCaptureAddonMessage(player, ss.str());
+}
+
+static void SendGuardianEntry(Player* player, uint8 slot, uint32 creatureEntry)
+{
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tENTRY:" << (uint32)slot << ":" << creatureEntry;
+    SendCaptureAddonMessage(player, ss.str());
+}
+
 // Forward declarations for data types
 struct GuardianSlotData;
 class CapturedGuardianData;
@@ -455,6 +472,20 @@ public:
                 float x, y, z;
                 _owner->GetClosePoint(x, y, z, me->GetCombatReach(), GetFollowDist(), GetFollowAngle());
                 me->NearTeleportTo(x, y, z, me->GetOrientation());
+            }
+        }
+
+        // Send health/power sync to owner addon
+        _healthPowerSyncTimer -= diff;
+        if (_healthPowerSyncTimer <= 0)
+        {
+            _healthPowerSyncTimer = 1000;
+            if (_owner && _owner->IsInWorld())
+            {
+                SendGuardianHealthPower(_owner, _slotIndex,
+                    me->GetHealth(), me->GetMaxHealth(),
+                    me->GetPower(me->getPowerType()), me->GetMaxPower(me->getPowerType()),
+                    static_cast<uint8>(me->getPowerType()));
             }
         }
 
@@ -1286,6 +1317,7 @@ private:
     int32 _summonCheckTimer = 1000;
     int32 _helpCryTimer = 0;
     int32 _tauntTimer = 0;
+    int32 _healthPowerSyncTimer = 1000;
     bool  _hasTauntSpell;
     std::vector<ObjectGuid> _summonedGuids;
 };
@@ -1302,6 +1334,7 @@ static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const
     SendGuardianArchetype(player, slot, slotData.archetype);
     SendGuardianSpells(player, slot, slotData.spellSlots);
     SendGuardianPower(player, slot, slotData.guardianPowerType);
+    SendGuardianEntry(player, slot, slotData.guardianEntry);
     if (slotData.IsActive())
         SendGuardianGuid(player, slot, slotData.guardianGuid);
 }

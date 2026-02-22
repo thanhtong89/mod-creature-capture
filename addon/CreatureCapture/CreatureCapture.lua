@@ -19,10 +19,15 @@ for i = 0, MAX_SLOTS - 1 do
         spellSlots = {0, 0, 0, 0, 0, 0, 0, 0},
         hasGuardian = false,
         creatureGuid = nil,  -- hex GUID string from server, matches UnitGUID format
+        curHP = 0, maxHP = 1,
+        curPow = 0, maxPow = 1,
+        powType = 0,
+        creatureEntry = 0,
     }
 end
 
 local selectedSlot = -1  -- -1 = none selected
+local guardianFrames = {}  -- forward declaration; populated after spellbook
 
 local ARCHETYPE_NAMES = { [0] = "DPS", [1] = "Tank", [2] = "Healer" }
 local ARCHETYPE_COLORS = {
@@ -514,6 +519,10 @@ end
 
 local function OnTargetChanged()
     local targetGuid = UnitGUID("target")
+
+    -- Update guardian frame target highlights
+    RefreshGuardianFrames()
+
     if not targetGuid then
         selectedSlot = -1
         spellbook:Hide()
@@ -576,7 +585,16 @@ local function ParseName(payload)
     guardians[slot].guardianName = name or ""
     guardians[slot].hasGuardian = true
 
+    -- Update targeting macro (outside combat only)
+    if not InCombatLockdown() then
+        local f = guardianFrames[slot]
+        if f and guardians[slot].creatureGuid then
+            f:SetAttribute("macrotext", "/targetexact " .. (name or "Guardian"))
+        end
+    end
+
     RefreshSpellbook()
+    RefreshGuardianFrames()
 end
 
 local function ParseGuid(payload)
@@ -587,6 +605,18 @@ local function ParseGuid(payload)
 
     guardians[slot].creatureGuid = guidStr or nil
     guardians[slot].hasGuardian = true
+
+    -- Update targeting macro for this frame (outside combat only)
+    if not InCombatLockdown() then
+        local f = guardianFrames[slot]
+        if f then
+            local g = guardians[slot]
+            local name = g.guardianName ~= "" and g.guardianName or "Guardian"
+            f:SetAttribute("macrotext", "/targetexact " .. name)
+        end
+    end
+
+    RefreshGuardianFrames()
 end
 
 local function ParseDismiss(payload)
@@ -599,6 +629,33 @@ local function ParseDismiss(payload)
     guardians[slot].creatureGuid = nil
 
     RefreshSpellbook()
+    RefreshGuardianFrames()
+end
+
+local function ParseHealthPower(payload)
+    -- HPOW:<slot>:<curHP>:<maxHP>:<curPow>:<maxPow>:<powType>
+    local parts = {strsplit(":", payload)}
+    local slot = tonumber(parts[2])
+    if not slot or slot < 0 or slot >= MAX_SLOTS then return end
+
+    local g = guardians[slot]
+    g.curHP = tonumber(parts[3]) or 0
+    g.maxHP = tonumber(parts[4]) or 1
+    g.curPow = tonumber(parts[5]) or 0
+    g.maxPow = tonumber(parts[6]) or 1
+    g.powType = tonumber(parts[7]) or 0
+
+    RefreshGuardianFrames()
+end
+
+local function ParseEntry(payload)
+    -- ENTRY:<slot>:<creatureEntry>
+    local parts = {strsplit(":", payload)}
+    local slot = tonumber(parts[2])
+    if not slot or slot < 0 or slot >= MAX_SLOTS then return end
+
+    guardians[slot].creatureEntry = tonumber(parts[3]) or 0
+    RefreshGuardianFrames()
 end
 
 local function ParseClear(payload)
@@ -614,6 +671,10 @@ local function ParseClear(payload)
         spellSlots = {0, 0, 0, 0, 0, 0, 0, 0},
         hasGuardian = false,
         creatureGuid = nil,
+        curHP = 0, maxHP = 1,
+        curPow = 0, maxPow = 1,
+        powType = 0,
+        creatureEntry = 0,
     }
 
     -- If this was the selected slot, pick another
@@ -628,6 +689,180 @@ local function ParseClear(payload)
     end
 
     RefreshSpellbook()
+    RefreshGuardianFrames()
+end
+
+-- ============================================================================
+-- Guardian Unit Frames (focus-style, below minimap)
+-- ============================================================================
+
+local GFRAME_WIDTH = 130
+local GFRAME_HEIGHT = 42
+local GFRAME_GAP = 4
+local GFRAME_BAR_HEIGHT = 10
+local GFRAME_PORTRAIT_SIZE = 36
+
+local GFRAME_BACKDROP = {
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets = {left = 2, right = 2, top = 2, bottom = 2},
+}
+
+-- Power type colors: 0=mana(blue), 1=rage(red), 2=focus(orange), 3=energy(yellow)
+local POWER_COLORS = {
+    [0] = {0.0, 0.0, 1.0},    -- Mana = blue
+    [1] = {1.0, 0.0, 0.0},    -- Rage = red
+    [2] = {1.0, 0.5, 0.0},    -- Focus = orange
+    [3] = {1.0, 1.0, 0.0},    -- Energy = yellow
+}
+
+for i = 0, MAX_SLOTS - 1 do
+    local f = CreateFrame("Button", "CaptureGuardianFrame" .. i, UIParent, "SecureActionButtonTemplate")
+    f:SetWidth(GFRAME_WIDTH)
+    f:SetHeight(GFRAME_HEIGHT)
+    f:SetPoint("TOPRIGHT", MinimapCluster, "BOTTOMRIGHT", 0, -(i * (GFRAME_HEIGHT + GFRAME_GAP)))
+    f:SetBackdrop(GFRAME_BACKDROP)
+    f:SetBackdropColor(0.05, 0.05, 0.08, 0.85)
+    f:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.8)
+    f:SetFrameStrata("HIGH")
+    f:SetAttribute("type", "macro")
+    f:SetAttribute("macrotext", "")
+    f:RegisterForClicks("LeftButtonUp")
+    -- Drag with right button so left click can target via secure macro
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("RightButton")
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local point, _, relPoint, x, y = self:GetPoint()
+        CreatureCaptureDB["guardianFrame" .. i] = {point, relPoint, x, y}
+    end)
+    f:Hide()
+
+    -- 3D portrait
+    local portrait = CreateFrame("PlayerModel", nil, f)
+    portrait:SetWidth(GFRAME_PORTRAIT_SIZE)
+    portrait:SetHeight(GFRAME_PORTRAIT_SIZE)
+    portrait:SetPoint("LEFT", f, "LEFT", 3, 0)
+    f.portrait = portrait
+
+    -- Name text
+    local name = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    name:SetPoint("TOPLEFT", portrait, "TOPRIGHT", 4, -1)
+    name:SetPoint("RIGHT", f, "RIGHT", -3, 0)
+    name:SetJustifyH("LEFT")
+    name:SetTextColor(1, 1, 1)
+    name:SetText("")
+    f.nameText = name
+
+    -- Health bar
+    local hpBar = CreateFrame("StatusBar", nil, f)
+    hpBar:SetHeight(GFRAME_BAR_HEIGHT)
+    hpBar:SetPoint("TOPLEFT", portrait, "TOPRIGHT", 4, -12)
+    hpBar:SetPoint("RIGHT", f, "RIGHT", -4, 0)
+    hpBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    hpBar:SetMinMaxValues(0, 1)
+    hpBar:SetValue(1)
+    hpBar:SetStatusBarColor(0.0, 0.8, 0.0)
+
+    local hpBg = hpBar:CreateTexture(nil, "BACKGROUND")
+    hpBg:SetAllPoints()
+    hpBg:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    hpBg:SetVertexColor(0.15, 0.15, 0.15, 0.8)
+
+    local hpText = hpBar:CreateFontString(nil, "OVERLAY")
+    hpText:SetFont("Fonts\\FRIZQT__.TTF", 8, "OUTLINE")
+    hpText:SetPoint("CENTER", hpBar)
+    hpText:SetTextColor(1, 1, 1)
+    f.hpBar = hpBar
+    f.hpText = hpText
+
+    -- Power bar
+    local powBar = CreateFrame("StatusBar", nil, f)
+    powBar:SetHeight(GFRAME_BAR_HEIGHT - 3)
+    powBar:SetPoint("TOPLEFT", hpBar, "BOTTOMLEFT", 0, -1)
+    powBar:SetPoint("RIGHT", f, "RIGHT", -4, 0)
+    powBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    powBar:SetMinMaxValues(0, 1)
+    powBar:SetValue(1)
+    powBar:SetStatusBarColor(0.0, 0.0, 1.0)
+
+    local powBg = powBar:CreateTexture(nil, "BACKGROUND")
+    powBg:SetAllPoints()
+    powBg:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    powBg:SetVertexColor(0.15, 0.15, 0.15, 0.8)
+    f.powBar = powBar
+
+    -- Target highlight glow
+    local highlight = f:CreateTexture(nil, "OVERLAY")
+    highlight:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
+    highlight:SetBlendMode("ADD")
+    highlight:SetPoint("TOPLEFT", f, "TOPLEFT", -8, 8)
+    highlight:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 8, -8)
+    highlight:SetVertexColor(1, 1, 1, 0.6)
+    highlight:Hide()
+    f.highlight = highlight
+
+    guardianFrames[i] = f
+end
+
+local function GetHealthColor(pct)
+    if pct > 0.5 then
+        return 0.0 + (1.0 - pct) * 2.0, 0.8, 0.0
+    else
+        return 0.8, pct * 1.6, 0.0
+    end
+end
+
+function RefreshGuardianFrames()
+    local targetGuid = UnitGUID("target")
+    for i = 0, MAX_SLOTS - 1 do
+        local g = guardians[i]
+        local f = guardianFrames[i]
+        if g.creatureGuid then
+            -- Update name
+            f.nameText:SetText(g.guardianName ~= "" and g.guardianName or "Guardian")
+
+            -- Update health bar
+            local maxHP = g.maxHP > 0 and g.maxHP or 1
+            f.hpBar:SetMinMaxValues(0, maxHP)
+            f.hpBar:SetValue(g.curHP)
+            local hpPct = g.curHP / maxHP
+            f.hpBar:SetStatusBarColor(GetHealthColor(hpPct))
+            f.hpText:SetText(math.floor(hpPct * 100 + 0.5) .. "%")
+
+            -- Update power bar
+            local maxPow = g.maxPow > 0 and g.maxPow or 1
+            f.powBar:SetMinMaxValues(0, maxPow)
+            f.powBar:SetValue(g.curPow)
+            local powColor = POWER_COLORS[g.powType] or POWER_COLORS[0]
+            f.powBar:SetStatusBarColor(powColor[1], powColor[2], powColor[3])
+
+            -- Update portrait (only when entry changes)
+            if g.creatureEntry > 0 and f.lastEntry ~= g.creatureEntry then
+                f.portrait:SetCreature(g.creatureEntry)
+                f.lastEntry = g.creatureEntry
+            end
+
+            -- Archetype border tint
+            local archColor = ARCHETYPE_COLORS[g.archetype] or ARCHETYPE_COLORS[0]
+            f:SetBackdropBorderColor(archColor[1], archColor[2], archColor[3], 0.9)
+
+            -- Target highlight
+            if targetGuid and g.creatureGuid == targetGuid then
+                f.highlight:Show()
+            else
+                f.highlight:Hide()
+            end
+
+            f:Show()
+        else
+            f.highlight:Hide()
+            f:Hide()
+        end
+    end
 end
 
 -- ============================================================================
@@ -656,6 +891,10 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, ...)
             ParseDismiss(msg)
         elseif msg:find("^CLEAR") then
             ParseClear(msg)
+        elseif msg:find("^HPOW") then
+            ParseHealthPower(msg)
+        elseif msg:find("^ENTRY") then
+            ParseEntry(msg)
         end
 
     elseif event == "PLAYER_TARGET_CHANGED" then
@@ -663,6 +902,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, ...)
 
     elseif event == "PLAYER_LOGIN" then
         RestorePosition(spellbook, "spellbook")
+        for i = 0, MAX_SLOTS - 1 do
+            RestorePosition(guardianFrames[i], "guardianFrame" .. i)
+        end
     end
 end)
 
