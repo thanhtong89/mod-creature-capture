@@ -87,6 +87,22 @@ local function RestorePosition(frame, key)
     end
 end
 
+-- Helper: find unit token for a GUID by scanning known unit IDs
+local function FindUnitTokenByGuid(guid)
+    if not guid then return nil end
+    -- Check common unit tokens that guardians/minions might appear under
+    local tokens = {"pet", "target", "focus", "mouseover"}
+    for _, token in ipairs(tokens) do
+        if UnitGUID(token) == guid then return token end
+    end
+    -- Check party/raid pets
+    for i = 1, 4 do
+        local token = "partypet" .. i
+        if UnitGUID(token) == guid then return token end
+    end
+    return nil
+end
+
 -- Helper: find a spell's spellbook index by spell ID
 local function FindSpellBookIndex(targetSpellId)
     local i = 1
@@ -840,10 +856,15 @@ function RefreshGuardianFrames()
             local powColor = POWER_COLORS[g.powType] or POWER_COLORS[0]
             f.powBar:SetStatusBarColor(powColor[1], powColor[2], powColor[3])
 
-            -- Update portrait (only when entry changes)
-            if g.creatureEntry > 0 and f.lastEntry ~= g.creatureEntry then
-                f.portrait:SetCreature(g.creatureEntry)
-                f.lastEntry = g.creatureEntry
+            -- Update portrait: use SetUnit for proper textured headshot
+            local unitToken = FindUnitTokenByGuid(g.creatureGuid)
+            if unitToken then
+                f.portrait:SetUnit(unitToken)
+                f.portrait:SetCamera(0)
+                f.portrait:Show()
+                f.portraitSet = true
+            elseif not f.portraitSet then
+                f.portrait:Hide()
             end
 
             -- Archetype border tint
@@ -860,6 +881,8 @@ function RefreshGuardianFrames()
             f:Show()
         else
             f.highlight:Hide()
+            f.portraitSet = false
+            f.portrait:Hide()
             f:Hide()
         end
     end
