@@ -885,6 +885,19 @@ private:
     void UpdateDpsAI(uint32 /*diff*/)
     {
         DoMeleeAttackIfReady();
+
+        // Priority 1: Buff allies (owner + other guardians + self) — e.g. Fire Shield
+        if (DoCastAllyBuffs())
+            return;
+
+        // Priority 2: Self buffs
+        if (DoCastSelfBuffs())
+            return;
+
+        // Priority 3: Debuffs on current target
+        DoCastDebuffSpells();
+
+        // Priority 4: Offensive damage spells
         DoCastOffensiveSpells();
     }
 
