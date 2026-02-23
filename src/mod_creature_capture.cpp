@@ -2155,6 +2155,7 @@ public:
     CreatureCapturePlayerScript() : PlayerScript("CreatureCapturePlayerScript", {
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_UPDATE,
         PLAYERHOOK_ON_BEFORE_TELEPORT,
         PLAYERHOOK_ON_MAP_CHANGED,
         PLAYERHOOK_ON_LEVEL_CHANGED
@@ -2214,6 +2215,42 @@ public:
         {
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00[Creature Capture]|r Target a creature and use your Tesseract to capture it!");
+        }
+    }
+
+    void OnPlayerUpdate(Player* player, uint32 /*p_time*/) override
+    {
+        if (!config.enabled)
+            return;
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        bool mountedOrFlying = player->IsMounted() || player->IsInFlight();
+
+        if (mountedOrFlying)
+        {
+            // Temporarily despawn any active guardians while mounted/flying
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (!s.IsActive())
+                    continue;
+
+                SnapshotGuardianSlot(player, i);
+                if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
+                    guardian->DespawnOrUnsummon();
+                s.guardianGuid.Clear();
+                SendGuardianDismiss(player, i);
+            }
+        }
+        else
+        {
+            // Resummon any occupied, non-dismissed guardians that aren't currently active
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (s.IsOccupied() && !s.IsActive() && !s.dismissed)
+                    SummonGuardianSlot(player, i);
+            }
         }
     }
 
