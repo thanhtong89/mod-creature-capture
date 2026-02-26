@@ -349,6 +349,9 @@ public:
     }
 };
 
+// Forward declaration for function used by CapturedGuardianAI::JustDied
+static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex);
+
 // ============================================================================
 // CapturedGuardianAI — Archetype-driven combat AI
 // ============================================================================
@@ -820,7 +823,21 @@ public:
     void JustDied(Unit* /*killer*/) override
     {
         if (_owner)
+        {
             ChatHandler(_owner->GetSession()).PSendSysMessage("Your captured guardian has died.");
+
+            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            GuardianSlotData& s = data->slots[_slotIndex];
+
+            if (s.IsOccupied())
+            {
+                s.guardianGuid.Clear();
+                s.guardianHealth = 1;
+                s.dismissed = true;
+                SaveGuardianSlotToDb(_owner, &s, _slotIndex);
+                SendGuardianDismiss(_owner, _slotIndex);
+            }
+        }
     }
 
 private:
@@ -2646,9 +2663,9 @@ public:
                 AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, label,
                     GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_DISMISS);
             }
-            else
+            else if (!player->IsInCombat())
             {
-                // Stored guardian — clicking summons
+                // Stored guardian — clicking summons (only outside combat)
                 std::string label = "[" + std::to_string(i + 1) + "] Summon " + name + " (" + ArchetypeName(s.archetype) + ")";
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, label,
                     GOSSIP_SENDER_MAIN, i * 10 + TESSERACT_ACTION_SUMMON);
@@ -2681,7 +2698,7 @@ public:
                 else               anyStored = true;
             }
 
-            if (anyStored)
+            if (anyStored && !player->IsInCombat())
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, ">> Summon All <<",
                     GOSSIP_SENDER_MAIN, TESSERACT_ACTION_SUMMON_ALL);
             if (anyActive)
