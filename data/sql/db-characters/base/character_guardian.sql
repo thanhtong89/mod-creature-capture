@@ -16,15 +16,18 @@ CREATE TABLE IF NOT EXISTS `character_guardian` (
     `display_id` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Creature display ID for model restoration',
     `equipment_id` TINYINT NOT NULL DEFAULT 0 COMMENT 'Equipment template ID for weapon restoration',
     `power_chosen` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=free pick available, 1=must pay gold',
+    `ranged_dps` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=melee DPS stance, 1=ranged DPS stance',
     `dismissed` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '1=explicitly dismissed, 0=auto-summon on login',
     `save_time` INT UNSIGNED NOT NULL DEFAULT 0,
     PRIMARY KEY (`id`),
     UNIQUE KEY `idx_owner_slot` (`owner`, `slot`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Creature Capture Module - Multi-Slot Guardian Storage';
 
--- Migration: add power_chosen column for existing installations
--- Harmlessly errors if column already exists (e.g. fresh install)
-ALTER TABLE `character_guardian`
-    ADD COLUMN `power_chosen` TINYINT UNSIGNED NOT NULL DEFAULT 0
-    COMMENT '0=free pick available, 1=must pay gold'
-    AFTER `equipment_id`;
+-- Migrations: add columns for existing installations (safe to re-run)
+SET @have_power_chosen = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'character_guardian' AND COLUMN_NAME = 'power_chosen');
+SET @sql = IF(@have_power_chosen = 0, "ALTER TABLE `character_guardian` ADD COLUMN `power_chosen` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=free pick available, 1=must pay gold' AFTER `equipment_id`", 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @have_ranged_dps = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'character_guardian' AND COLUMN_NAME = 'ranged_dps');
+SET @sql = IF(@have_ranged_dps = 0, "ALTER TABLE `character_guardian` ADD COLUMN `ranged_dps` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=melee DPS stance, 1=ranged DPS stance' AFTER `power_chosen`", 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

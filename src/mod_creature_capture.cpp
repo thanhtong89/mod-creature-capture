@@ -80,6 +80,8 @@ enum GuardianGossipActions
 {
     GUARDIAN_ACTION_BASE            = 100,
     GUARDIAN_RESOURCE_OFFSET        = 3,   // resource subAction = 3 + powerType
+    GUARDIAN_DPS_MELEE              = 7,   // subAction for melee DPS stance
+    GUARDIAN_DPS_RANGED             = 8,   // subAction for ranged DPS stance
     GUARDIAN_ACTION_DISMISS         = 198,
     GUARDIAN_ACTION_CLOSE           = 199
 };
@@ -290,6 +292,7 @@ struct GuardianSlotData
     uint32 displayId        = 0;
     int8   equipmentId      = 0;
     bool   powerChosen      = false;
+    bool   rangedDps        = false;
     bool   dismissed        = false;
     bool   savedToDb        = false;
 
@@ -306,6 +309,7 @@ struct GuardianSlotData
         displayId = 0;
         equipmentId = 0;
         powerChosen = false;
+        rangedDps = false;
         dismissed = false;
         savedToDb = false;
     }
@@ -352,11 +356,13 @@ public:
 class CapturedGuardianAI : public CreatureAI
 {
 public:
-    explicit CapturedGuardianAI(Creature* creature, uint8 archetype, uint32 const* spells, uint8 slotIndex)
+    explicit CapturedGuardianAI(Creature* creature, uint8 archetype, uint32 const* spells, uint8 slotIndex, bool rangedDps = false)
         : CreatureAI(creature),
         _owner(nullptr),
         _archetype(archetype),
         _slotIndex(slotIndex),
+        _rangedDps(rangedDps),
+        _preferredRange(0.0f),
         _updateTimer(1000),
         _combatCheckTimer(500),
         _regenTimer(2000)
@@ -381,6 +387,8 @@ public:
             }
         }
 
+        RecalcPreferredRange();
+
         if (ObjectGuid ownerGuid = me->GetOwnerGUID())
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
     }
@@ -398,6 +406,7 @@ public:
     void SetArchetype(uint8 arch)
     {
         _archetype = arch;
+        RecalcPreferredRange();
         if (_owner && !me->GetVictim())
         {
             me->GetMotionMaster()->Clear();
@@ -407,6 +416,18 @@ public:
 
     uint8 GetArchetype() const { return _archetype; }
     uint8 GetSlotIndex() const { return _slotIndex; }
+    bool  IsRangedDps()  const { return _rangedDps; }
+
+    void SetRangedDps(bool ranged)
+    {
+        _rangedDps = ranged;
+        RecalcPreferredRange();
+        if (_owner && !me->GetVictim())
+        {
+            me->GetMotionMaster()->Clear();
+            me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
+        }
+    }
 
     void SetSpell(uint32 slot, uint32 spellId)
     {
@@ -430,6 +451,8 @@ public:
                 }
             }
         }
+
+        RecalcPreferredRange();
     }
 
     uint32 GetSpell(uint32 slot) const
@@ -743,7 +766,14 @@ public:
         }
 
         if (me->Attack(target, true))
-            me->GetMotionMaster()->MoveChase(target);
+        {
+            // Ranged DPS and healers with ranged spells keep their distance
+            if (_preferredRange > 5.0f &&
+                ((_archetype == ARCHETYPE_DPS && _rangedDps) || _archetype == ARCHETYPE_HEALER))
+                me->GetMotionMaster()->MoveChase(target, _preferredRange);
+            else
+                me->GetMotionMaster()->MoveChase(target);
+        }
     }
 
     void EnterEvadeMode(EvadeReason /*why*/) override
@@ -823,6 +853,46 @@ private:
                spellInfo->ManaCostPerlevel == 0;
     }
 
+    // Check if a spell is ranged (max range > 5 yards, non-melee)
+    bool IsRangedSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo)
+            return false;
+
+        return spellInfo->GetMaxRange(false) > 5.0f &&
+               spellInfo->DmgClass != SPELL_DAMAGE_CLASS_MELEE;
+    }
+
+    // Recalculate preferred ranged distance from taught spells.
+    // Used by ranged DPS stance and healers (healers always prefer range).
+    void RecalcPreferredRange()
+    {
+        _preferredRange = 0.0f;
+        if (!_rangedDps && _archetype != ARCHETYPE_HEALER)
+            return;
+
+        float minRange = 999.0f;
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            if (!_spellSlots[i])
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(_spellSlots[i]);
+            if (!spellInfo || spellInfo->IsPositive())
+                continue;
+
+            if (IsRangedSpell(spellInfo))
+            {
+                float maxRange = spellInfo->GetMaxRange(false);
+                if (maxRange < minRange)
+                    minRange = maxRange;
+            }
+        }
+
+        if (minRange < 999.0f)
+            _preferredRange = minRange * 0.8f; // stay slightly inside max range
+    }
+
     // Find an enemy attacking any fellow guardian
     Unit* FindAllyAttacker()
     {
@@ -884,6 +954,14 @@ private:
 
     void UpdateDpsAI(uint32 /*diff*/)
     {
+        if (_rangedDps && _preferredRange > 5.0f)
+            UpdateRangedDpsAI();
+        else
+            UpdateMeleeDpsAI();
+    }
+
+    void UpdateMeleeDpsAI()
+    {
         DoMeleeAttackIfReady();
 
         // Priority 1: Buff allies (owner + other guardians + self) — e.g. Fire Shield
@@ -898,6 +976,28 @@ private:
         DoCastDebuffSpells();
 
         // Priority 4: Offensive damage spells
+        DoCastOffensiveSpells();
+    }
+
+    void UpdateRangedDpsAI()
+    {
+        // Priority 1: Ranged offensive spells
+        if (DoCastRangedOffensiveSpells())
+            return;
+
+        // Priority 2: Buff allies
+        if (DoCastAllyBuffs())
+            return;
+
+        // Priority 3: Self buffs
+        if (DoCastSelfBuffs())
+            return;
+
+        // Priority 4: Debuffs on current target
+        DoCastDebuffSpells();
+
+        // Fallback: melee if enemy is close
+        DoMeleeAttackIfReady();
         DoCastOffensiveSpells();
     }
 
@@ -983,7 +1083,10 @@ private:
         if (DoCastDebuffSpells())
             return;
 
-        // Priority 5: Conservative attack — autoattack + free-cost spells only
+        // Priority 5: Conservative attack — prefer ranged if available, else melee
+        if (_preferredRange > 5.0f && DoCastFreeOffensiveSpells(true))
+            return;
+
         DoMeleeAttackIfReady();
         DoCastFreeOffensiveSpells();
     }
@@ -1029,14 +1132,14 @@ private:
         }
     }
 
-    void DoCastFreeOffensiveSpells()
+    bool DoCastRangedOffensiveSpells()
     {
         if (me->HasUnitState(UNIT_STATE_CASTING))
-            return;
+            return false;
 
         Unit* target = me->GetVictim();
         if (!target)
-            return;
+            return false;
 
         for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
         {
@@ -1051,8 +1154,56 @@ private:
             if (spellInfo->IsPositive())
                 continue;
 
-            // Only cast spells with zero power cost
+            // Only cast ranged spells in this pass
+            if (!IsRangedSpell(spellInfo))
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            if (!me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                continue;
+
+            bool isPeriodic = spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
+                              spellInfo->HasAura(SPELL_AURA_PERIODIC_LEECH) ||
+                              spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT);
+            if (isPeriodic && target->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            me->CastSpell(target, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo, false);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool DoCastFreeOffensiveSpells(bool rangedOnly = false)
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING))
+            return false;
+
+        Unit* target = me->GetVictim();
+        if (!target)
+            return false;
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo || !spellInfo->CanBeUsedInCombat())
+                continue;
+
+            if (spellInfo->IsPositive())
+                continue;
+
             if (!IsFreeCostSpell(spellInfo))
+                continue;
+
+            if (rangedOnly && !IsRangedSpell(spellInfo))
                 continue;
 
             if (me->HasSpellCooldown(spellId))
@@ -1070,8 +1221,10 @@ private:
 
             me->CastSpell(target, spellId, false);
             ApplySpellCooldown(spellId, spellInfo, false);
-            break;
+            return true;
         }
+
+        return false;
     }
 
     bool DoCastHealingSpells()
@@ -1323,6 +1476,8 @@ private:
     Player* _owner;
     uint8 _archetype;
     uint8 _slotIndex;
+    bool  _rangedDps;
+    float _preferredRange;
     uint32 _spellSlots[MAX_GUARDIAN_SPELLS];
     int32 _updateTimer;
     int32 _combatCheckTimer;
@@ -1425,8 +1580,8 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
     auto trans = CharacterDatabase.BeginTransaction();
     trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
-        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, dismissed, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, UNIX_TIMESTAMP())",
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1439,6 +1594,7 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         slotData->displayId,
         slotData->equipmentId,
         slotData->powerChosen ? 1 : 0,
+        slotData->rangedDps ? 1 : 0,
         slotData->dismissed ? 1 : 0
     );
     CharacterDatabase.CommitTransaction(trans);
@@ -1460,7 +1616,7 @@ static void LoadGuardiansFromDb(Player* player)
     uint32 ownerGuid = player->GetGUID().GetCounter();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, dismissed "
+        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
@@ -1488,7 +1644,8 @@ static void LoadGuardiansFromDb(Player* player)
         s.displayId         = fields[8].Get<uint32>();
         s.equipmentId       = fields[9].Get<int8>();
         s.powerChosen       = fields[10].Get<uint8>() != 0;
-        s.dismissed         = fields[11].Get<uint8>() != 0;
+        s.rangedDps         = fields[11].Get<uint8>() != 0;
+        s.dismissed         = fields[12].Get<uint8>() != 0;
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -1528,7 +1685,7 @@ static void SnapshotGuardianSlot(Player* player, uint8 slotIndex)
 
 // Forward declaration (defined below after helper functions)
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
-    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0, bool powerChosen = false);
+    uint32* spells, uint8 slotIndex, uint32 displayId = 0, int8 equipmentId = 0, uint8 powerType = 0, bool powerChosen = false, bool rangedDps = false);
 
 // Summon a guardian from a stored slot. Syncs level, restores HP/power, updates state.
 // Returns the summoned creature, or nullptr on failure.
@@ -1543,7 +1700,7 @@ static TempSummon* SummonGuardianSlot(Player* player, uint8 slotIndex, bool save
     s.guardianLevel = player->GetLevel();
 
     TempSummon* guardian = SummonCapturedGuardian(player, s.guardianEntry, s.guardianLevel,
-        s.archetype, s.spellSlots, slotIndex, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen);
+        s.archetype, s.spellSlots, slotIndex, s.displayId, s.equipmentId, s.guardianPowerType, s.powerChosen, s.rangedDps);
     if (!guardian)
         return nullptr;
 
@@ -1686,7 +1843,7 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
 // ============================================================================
 
 static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 level, uint8 archetype,
-    uint32* spells, uint8 slotIndex, uint32 displayId, int8 equipmentId, uint8 powerType, bool powerChosen)
+    uint32* spells, uint8 slotIndex, uint32 displayId, int8 equipmentId, uint8 powerType, bool powerChosen, bool rangedDps)
 {
     float angle = GUARDIAN_FOLLOW_ANGLES[slotIndex % MAX_GUARDIAN_SLOTS];
 
@@ -1745,7 +1902,7 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
 
     // Install archetype-driven AI
-    guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex));
+    guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex, rangedDps));
 
     return guardian;
 }
@@ -1969,7 +2126,8 @@ public:
             if (guardian)
                 handler->PSendSysMessage("Health: {} / {}", guardian->GetHealth(), guardian->GetMaxHealth());
             handler->PSendSysMessage("Entry: {}", s.guardianEntry);
-            handler->PSendSysMessage("Archetype: {}", ArchetypeName(s.archetype));
+            handler->PSendSysMessage("Archetype: {}{}", ArchetypeName(s.archetype),
+                s.archetype == ARCHETYPE_DPS ? (s.rangedDps ? " (Ranged)" : " (Melee)") : "");
             handler->PSendSysMessage("Resource: {} ({})", PowerTypeName(s.guardianPowerType),
                 s.powerChosen ? "chosen" : "default");
             handler->PSendSysMessage("Status: {}", s.IsActive() ? "Active" : "Stored");
@@ -2695,6 +2853,15 @@ public:
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, tankLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_TANK);
         AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, healLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + ARCHETYPE_HEALER);
 
+        // DPS stance: melee vs ranged (only shown for DPS guardians)
+        if (s.archetype == ARCHETYPE_DPS)
+        {
+            std::string meleeLabel = std::string("[Stance] Melee DPS") + (!s.rangedDps ? " (active)" : "");
+            std::string rangedLabel = std::string("[Stance] Ranged DPS") + (s.rangedDps ? " (active)" : "");
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, meleeLabel,  GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + GUARDIAN_DPS_MELEE);
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, rangedLabel, GOSSIP_SENDER_MAIN, GUARDIAN_ACTION_BASE + slot * 10 + GUARDIAN_DPS_RANGED);
+        }
+
         // Append resource type selection
         uint32 switchCostCopper = s.powerChosen ? CalculateResourceSwitchCost(s.guardianLevel) : 0;
 
@@ -2833,6 +3000,39 @@ public:
             return true;
         }
 
+        // DPS stance change (subAction 7-8)
+        if (subAction == GUARDIAN_DPS_MELEE || subAction == GUARDIAN_DPS_RANGED)
+        {
+            bool wantRanged = (subAction == GUARDIAN_DPS_RANGED);
+
+            if (s.archetype != ARCHETYPE_DPS)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff0000[Guardian]|r Must be DPS archetype to change stance.");
+                return true;
+            }
+
+            if (s.rangedDps == wantRanged)
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cff00ff00[Guardian]|r Already in {} DPS stance.", wantRanged ? "Ranged" : "Melee");
+                return true;
+            }
+
+            s.rangedDps = wantRanged;
+
+            CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(creature->AI());
+            if (ai)
+                ai->SetRangedDps(wantRanged);
+
+            SaveGuardianSlotToDb(player, &s, slot);
+
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cff00ff00[Guardian]|r Slot {} switched to {} DPS stance.", slot + 1, wantRanged ? "Ranged" : "Melee");
+
+            return true;
+        }
+
         // Archetype change (subAction 0-2)
         if (subAction > ARCHETYPE_HEALER)
             return false;
@@ -2848,9 +3048,17 @@ public:
 
         s.archetype = newArchetype;
 
+        // Reset ranged DPS stance when switching away from DPS
+        if (newArchetype != ARCHETYPE_DPS)
+            s.rangedDps = false;
+
         CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(creature->AI());
         if (ai)
+        {
             ai->SetArchetype(newArchetype);
+            if (newArchetype != ARCHETYPE_DPS)
+                ai->SetRangedDps(false);
+        }
 
         SaveGuardianSlotToDb(player, &s, slot);
 
