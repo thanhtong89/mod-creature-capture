@@ -23,6 +23,11 @@ for i = 0, MAX_SLOTS - 1 do
         curPow = 0, maxPow = 1,
         powType = 0,
         creatureEntry = 0,
+        -- Bonus stats (leeched + fed)
+        bonusDmg = 0, bonusHP = 0, bonusMana = 0,
+        bonusArmor = 0, bonusHaste = 0,
+        bonusResHoly = 0, bonusResFire = 0, bonusResNature = 0,
+        bonusResFrost = 0, bonusResShadow = 0, bonusResArcane = 0,
     }
 end
 
@@ -674,6 +679,101 @@ local function ParseEntry(payload)
     RefreshGuardianFrames()
 end
 
+local function ParseBonus(payload)
+    -- BONUS:<slot>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    local parts = {strsplit(":", payload)}
+    local slot = tonumber(parts[2])
+    if not slot or slot < 0 or slot >= MAX_SLOTS then return end
+
+    local g = guardians[slot]
+    g.bonusDmg       = tonumber(parts[3]) or 0
+    g.bonusHP        = tonumber(parts[4]) or 0
+    g.bonusMana      = tonumber(parts[5]) or 0
+    g.bonusArmor     = tonumber(parts[6]) or 0
+    g.bonusHaste     = tonumber(parts[7]) or 0
+    g.bonusResHoly   = tonumber(parts[8]) or 0
+    g.bonusResFire   = tonumber(parts[9]) or 0
+    g.bonusResNature = tonumber(parts[10]) or 0
+    g.bonusResFrost  = tonumber(parts[11]) or 0
+    g.bonusResShadow = tonumber(parts[12]) or 0
+    g.bonusResArcane = tonumber(parts[13]) or 0
+
+    RefreshGuardianFrames()
+end
+
+-- Feed confirmation data (stored between popup show and accept)
+local feedData = {}
+
+local function BuildFeedPreviewText(itemLink, guardName, preview)
+    local lines = {"Feed " .. (itemLink or "item") .. " to " .. guardName .. "?"}
+    table.insert(lines, "The item will be destroyed.")
+    table.insert(lines, "")
+    table.insert(lines, "Expected stat gains:")
+    local any = false
+    if preview.dmg > 0 then
+        table.insert(lines, string.format("  +%.1f Damage", preview.dmg))
+        any = true
+    end
+    if preview.hp > 0 then
+        table.insert(lines, "  +" .. preview.hp .. " HP")
+        any = true
+    end
+    if preview.mana > 0 then
+        table.insert(lines, "  +" .. preview.mana .. " Mana")
+        any = true
+    end
+    if preview.armor > 0 then
+        table.insert(lines, "  +" .. preview.armor .. " Armor")
+        any = true
+    end
+    if preview.haste > 0 then
+        table.insert(lines, string.format("  +%.2f%% Haste", preview.haste))
+        any = true
+    end
+    if preview.resHoly > 0 then table.insert(lines, "  +" .. preview.resHoly .. " Holy Res"); any = true end
+    if preview.resFire > 0 then table.insert(lines, "  +" .. preview.resFire .. " Fire Res"); any = true end
+    if preview.resNature > 0 then table.insert(lines, "  +" .. preview.resNature .. " Nature Res"); any = true end
+    if preview.resFrost > 0 then table.insert(lines, "  +" .. preview.resFrost .. " Frost Res"); any = true end
+    if preview.resShadow > 0 then table.insert(lines, "  +" .. preview.resShadow .. " Shadow Res"); any = true end
+    if preview.resArcane > 0 then table.insert(lines, "  +" .. preview.resArcane .. " Arcane Res"); any = true end
+    if not any then
+        table.insert(lines, "  (no stat gains)")
+    end
+    return table.concat(lines, "\n")
+end
+
+local function ParseFeedPreview(payload)
+    -- FEEDPREVIEW:<slot>:<itemEntry>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    local parts = {strsplit(":", payload)}
+    local slot = tonumber(parts[2])
+    local itemEntry = tonumber(parts[3])
+    if not slot or not itemEntry then return end
+
+    local preview = {
+        dmg       = tonumber(parts[4]) or 0,
+        hp        = tonumber(parts[5]) or 0,
+        mana      = tonumber(parts[6]) or 0,
+        armor     = tonumber(parts[7]) or 0,
+        haste     = tonumber(parts[8]) or 0,
+        resHoly   = tonumber(parts[9]) or 0,
+        resFire   = tonumber(parts[10]) or 0,
+        resNature = tonumber(parts[11]) or 0,
+        resFrost  = tonumber(parts[12]) or 0,
+        resShadow = tonumber(parts[13]) or 0,
+        resArcane = tonumber(parts[14]) or 0,
+    }
+
+    local g = guardians[slot]
+    local guardName = (g and g.guardianName ~= "") and g.guardianName or "Guardian"
+
+    -- Get item link from saved feed data or fallback
+    local itemLink = feedData.itemLink or ("Item #" .. itemEntry)
+
+    feedData.itemEntry = itemEntry
+    local text = BuildFeedPreviewText(itemLink, guardName, preview)
+    StaticPopup_Show("CCAPTURE_FEED_CONFIRM", text)
+end
+
 local function ParseClear(payload)
     -- CLEAR:<slot>
     local _, slotStr = strsplit(":", payload)
@@ -691,6 +791,10 @@ local function ParseClear(payload)
         curPow = 0, maxPow = 1,
         powType = 0,
         creatureEntry = 0,
+        bonusDmg = 0, bonusHP = 0, bonusMana = 0,
+        bonusArmor = 0, bonusHaste = 0,
+        bonusResHoly = 0, bonusResFire = 0, bonusResNature = 0,
+        bonusResFrost = 0, bonusResShadow = 0, bonusResArcane = 0,
     }
 
     -- If this was the selected slot, pick another
@@ -707,6 +811,41 @@ local function ParseClear(payload)
     RefreshSpellbook()
     RefreshGuardianFrames()
 end
+
+-- ============================================================================
+-- Item Feeding Helpers
+-- ============================================================================
+
+-- Find an item in player bags by itemId, returns bag, slot
+local function FindItemInBags(itemId)
+    for bag = 0, 4 do
+        local numSlots = GetContainerNumSlots(bag)
+        for slot = 1, numSlots do
+            local link = GetContainerItemLink(bag, slot)
+            if link then
+                local id = tonumber(link:match("item:(%d+)"))
+                if id == itemId then
+                    return bag, slot
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+StaticPopupDialogs["CCAPTURE_FEED_CONFIRM"] = {
+    text = "%s",
+    button1 = "Feed",
+    button2 = "Cancel",
+    OnAccept = function()
+        if feedData.itemEntry then
+            SendChatMessage(".capture feed " .. feedData.itemEntry, "SAY")
+        end
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
 
 -- ============================================================================
 -- Guardian Unit Frames (focus-style, below minimap)
@@ -820,6 +959,94 @@ for i = 0, MAX_SLOTS - 1 do
     highlight:SetVertexColor(1, 1, 1, 0.6)
     highlight:Hide()
     f.highlight = highlight
+    f.slotIndex = i
+
+    -- Tooltip with bonus stats on hover
+    f:SetScript("OnEnter", function(self)
+        local g = guardians[self.slotIndex]
+        if not g or not g.creatureGuid then return end
+
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOMLEFT")
+        GameTooltip:AddLine(g.guardianName ~= "" and g.guardianName or "Guardian", 1, 1, 1)
+
+        local archName = ARCHETYPE_NAMES[g.archetype] or "DPS"
+        local archColor = ARCHETYPE_COLORS[g.archetype] or ARCHETYPE_COLORS[0]
+        GameTooltip:AddLine(archName, archColor[1], archColor[2], archColor[3])
+
+        -- Bonus stats
+        local hasBonus = false
+        if g.bonusDmg and g.bonusDmg > 0 then
+            GameTooltip:AddLine(string.format("+%.1f Bonus Damage", g.bonusDmg), 1, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusHP and g.bonusHP > 0 then
+            GameTooltip:AddLine("+" .. g.bonusHP .. " Bonus HP", 0, 1, 0)
+            hasBonus = true
+        end
+        if g.bonusMana and g.bonusMana > 0 then
+            GameTooltip:AddLine("+" .. g.bonusMana .. " Bonus Mana", 0.2, 0.5, 1)
+            hasBonus = true
+        end
+        if g.bonusArmor and g.bonusArmor > 0 then
+            GameTooltip:AddLine("+" .. g.bonusArmor .. " Bonus Armor", 1, 1, 0)
+            hasBonus = true
+        end
+        if g.bonusHaste and g.bonusHaste > 0 then
+            GameTooltip:AddLine(string.format("+%.2f%% Haste", g.bonusHaste), 0.8, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusResHoly and g.bonusResHoly > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResHoly .. " Holy Res", 1, 0.9, 0.5)
+            hasBonus = true
+        end
+        if g.bonusResFire and g.bonusResFire > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResFire .. " Fire Res", 1, 0.3, 0)
+            hasBonus = true
+        end
+        if g.bonusResNature and g.bonusResNature > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResNature .. " Nature Res", 0, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusResFrost and g.bonusResFrost > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResFrost .. " Frost Res", 0.2, 0.5, 1)
+            hasBonus = true
+        end
+        if g.bonusResShadow and g.bonusResShadow > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResShadow .. " Shadow Res", 0.5, 0, 0.8)
+            hasBonus = true
+        end
+        if g.bonusResArcane and g.bonusResArcane > 0 then
+            GameTooltip:AddLine("+" .. g.bonusResArcane .. " Arcane Res", 0.8, 0.6, 1)
+            hasBonus = true
+        end
+
+        if not hasBonus then
+            GameTooltip:AddLine("Drop equipment to feed stats", 0.5, 0.5, 0.5)
+        end
+
+        GameTooltip:Show()
+    end)
+    f:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
+    -- Item drag-and-drop for feeding: request stat preview from server
+    f:SetScript("OnReceiveDrag", function(self)
+        local infoType, itemId, itemLink = GetCursorInfo()
+        if infoType == "item" then
+            local g = guardians[self.slotIndex]
+            if not g or not g.hasGuardian then
+                ClearCursor()
+                return
+            end
+            -- Store the link for the preview dialog
+            feedData.itemLink = itemLink
+            feedData.itemEntry = itemId
+            -- Request stat preview from server (server validates and sends FEEDPREVIEW)
+            SendChatMessage(".capture feedpreview " .. itemId, "SAY")
+            ClearCursor()
+        end
+    end)
 
     guardianFrames[i] = f
 end
@@ -918,6 +1145,10 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, ...)
             ParseHealthPower(msg)
         elseif msg:find("^ENTRY") then
             ParseEntry(msg)
+        elseif msg:find("^BONUS") then
+            ParseBonus(msg)
+        elseif msg:find("^FEEDPREVIEW") then
+            ParseFeedPreview(msg)
         end
 
     elseif event == "PLAYER_TARGET_CHANGED" then

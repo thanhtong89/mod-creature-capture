@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 // Tesseract item constant (uses existing item 44807 from client Item.dbc)
@@ -158,6 +159,8 @@ struct CreatureCaptureConfig
     uint32 healthPct = 100;
     uint32 damagePct = 100;
     uint8 maxSlots = 4;
+    uint32 leechChance = 10;
+    uint32 leechPct = 2;
 
     void Load()
     {
@@ -172,6 +175,8 @@ struct CreatureCaptureConfig
         damagePct = sConfigMgr->GetOption<uint32>("CreatureCapture.DamagePct", 100);
         uint8 slots = sConfigMgr->GetOption<uint8>("CreatureCapture.MaxSlots", 4);
         maxSlots = std::max(uint8(1), std::min(uint8(MAX_GUARDIAN_SLOTS), slots));
+        leechChance = sConfigMgr->GetOption<uint32>("CreatureCapture.LeechChance", 10);
+        leechPct = sConfigMgr->GetOption<uint32>("CreatureCapture.LeechPct", 2);
     }
 };
 
@@ -272,6 +277,7 @@ static void SendGuardianEntry(Player* player, uint8 slot, uint32 creatureEntry)
 struct GuardianSlotData;
 class CapturedGuardianData;
 
+static void SendGuardianBonuses(Player* player, uint8 slot, GuardianSlotData const& s);
 static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const& slotData);
 static void SendAllSlotsState(Player* player);
 
@@ -296,6 +302,19 @@ struct GuardianSlotData
     bool   dismissed        = false;
     bool   savedToDb        = false;
 
+    // Bonus stats (leeched from kills + fed from items)
+    float  bonusDamage      = 0.0f;
+    uint32 bonusHealth      = 0;
+    uint32 bonusMana        = 0;
+    uint32 bonusArmor       = 0;
+    float  bonusHaste       = 0.0f;
+    int32  bonusResHoly     = 0;
+    int32  bonusResFire     = 0;
+    int32  bonusResNature   = 0;
+    int32  bonusResFrost    = 0;
+    int32  bonusResShadow   = 0;
+    int32  bonusResArcane   = 0;
+
     void Clear()
     {
         guardianGuid.Clear();
@@ -312,6 +331,17 @@ struct GuardianSlotData
         rangedDps = false;
         dismissed = false;
         savedToDb = false;
+        bonusDamage = 0.0f;
+        bonusHealth = 0;
+        bonusMana = 0;
+        bonusArmor = 0;
+        bonusHaste = 0.0f;
+        bonusResHoly = 0;
+        bonusResFire = 0;
+        bonusResNature = 0;
+        bonusResFrost = 0;
+        bonusResShadow = 0;
+        bonusResArcane = 0;
     }
 
     bool IsOccupied() const { return guardianEntry != 0; }
@@ -349,8 +379,9 @@ public:
     }
 };
 
-// Forward declaration for function used by CapturedGuardianAI::JustDied
+// Forward declarations for functions used by CapturedGuardianAI
 static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex);
+static void TryLeechFromKill(Player* owner, Creature* killed);
 
 // ============================================================================
 // CapturedGuardianAI — Archetype-driven combat AI
@@ -391,6 +422,11 @@ public:
         }
 
         RecalcPreferredRange();
+
+        // Equip fallback weapons for any spells that need them (e.g. Shoot needs a bow)
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+            if (_spellSlots[i])
+                EquipFallbackWeaponForSpell(_spellSlots[i]);
 
         if (ObjectGuid ownerGuid = me->GetOwnerGUID())
             _owner = ObjectAccessor::GetPlayer(*me, ownerGuid);
@@ -796,6 +832,7 @@ public:
             Creature* killed = victim->ToCreature();
             killed->SetLootRecipient(_owner);
             killed->LowerPlayerDamageReq(killed->GetMaxHealth());
+            TryLeechFromKill(_owner, killed);
         }
     }
 
@@ -1520,6 +1557,7 @@ static void SendFullSlotState(Player* player, uint8 slot, GuardianSlotData const
     SendGuardianSpells(player, slot, slotData.spellSlots);
     SendGuardianPower(player, slot, slotData.guardianPowerType);
     SendGuardianEntry(player, slot, slotData.guardianEntry);
+    SendGuardianBonuses(player, slot, slotData);
     if (slotData.IsActive())
         SendGuardianGuid(player, slot, slotData.guardianGuid);
 }
@@ -1531,6 +1569,131 @@ static void SendAllSlotsState(Player* player)
     {
         if (data->slots[i].IsOccupied())
             SendFullSlotState(player, i, data->slots[i]);
+    }
+}
+
+// ============================================================================
+// Addon Message — Bonus stats
+// ============================================================================
+
+static void SendGuardianBonuses(Player* player, uint8 slot, GuardianSlotData const& s)
+{
+    std::ostringstream ss;
+    ss << ADDON_PREFIX << "\tBONUS:" << (uint32)slot
+       << ":" << std::fixed << std::setprecision(1) << s.bonusDamage
+       << ":" << s.bonusHealth
+       << ":" << s.bonusMana
+       << ":" << s.bonusArmor
+       << ":" << std::fixed << std::setprecision(2) << s.bonusHaste
+       << ":" << s.bonusResHoly
+       << ":" << s.bonusResFire
+       << ":" << s.bonusResNature
+       << ":" << s.bonusResFrost
+       << ":" << s.bonusResShadow
+       << ":" << s.bonusResArcane;
+    SendCaptureAddonMessage(player, ss.str());
+}
+
+// ============================================================================
+// Kill Leech System
+// ============================================================================
+
+// Track last leech target per player to prevent double-rolling
+static std::unordered_map<uint64, ObjectGuid> s_lastLeechTarget;
+
+static void TryLeechFromKill(Player* owner, Creature* killed)
+{
+    if (!owner || !killed)
+        return;
+
+    // Anti-double-roll: skip if we already processed this kill
+    uint64 ownerKey = owner->GetGUID().GetRawValue();
+    ObjectGuid killedGuid = killed->GetGUID();
+    auto it = s_lastLeechTarget.find(ownerKey);
+    if (it != s_lastLeechTarget.end() && it->second == killedGuid)
+        return;
+    s_lastLeechTarget[ownerKey] = killedGuid;
+
+    CapturedGuardianData* data = owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+    float mobAvgDmg = (killed->GetFloatValue(UNIT_FIELD_MINDAMAGE) +
+                       killed->GetFloatValue(UNIT_FIELD_MAXDAMAGE)) / 2.0f;
+    uint32 mobMaxHP = killed->GetMaxHealth();
+    uint32 mobMaxMana = (killed->getPowerType() == POWER_MANA)
+                        ? killed->GetMaxPower(POWER_MANA) : 0;
+
+    float leechPct = static_cast<float>(config.leechPct) / 100.0f;
+
+    for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+    {
+        GuardianSlotData& s = data->slots[i];
+        if (!s.IsActive())
+            continue;
+
+        Creature* guardian = ObjectAccessor::GetCreature(*owner, s.guardianGuid);
+        if (!guardian || !guardian->IsAlive())
+            continue;
+
+        if (urand(1, 100) > config.leechChance)
+            continue;
+
+        bool leeched = false;
+        std::string msg;
+
+        // Leech damage
+        float guardianAvgDmg = (guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) +
+                                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE)) / 2.0f;
+        if (guardianAvgDmg < mobAvgDmg)
+        {
+            float gain = std::ceil(mobAvgDmg * leechPct * 10.0f) / 10.0f;
+            s.bonusDamage += gain;
+            guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
+                guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + gain);
+            guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
+                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + gain);
+            leeched = true;
+            msg += fmt::format("+{:.1f} damage", gain);
+        }
+
+        // Leech HP
+        uint32 guardianMaxHP = guardian->GetMaxHealth();
+        if (guardianMaxHP < mobMaxHP)
+        {
+            uint32 gain = std::max(1u, static_cast<uint32>(std::ceil(mobMaxHP * leechPct)));
+            s.bonusHealth += gain;
+            guardian->SetMaxHealth(guardianMaxHP + gain);
+            guardian->SetHealth(guardian->GetHealth() + gain);
+            leeched = true;
+            if (!msg.empty()) msg += ", ";
+            msg += fmt::format("+{} HP", gain);
+        }
+
+        // Leech mana
+        if (mobMaxMana > 0 && guardian->getPowerType() == POWER_MANA)
+        {
+            uint32 guardianMaxMana = guardian->GetMaxPower(POWER_MANA);
+            if (guardianMaxMana < mobMaxMana)
+            {
+                uint32 gain = std::max(1u, static_cast<uint32>(std::ceil(mobMaxMana * leechPct)));
+                s.bonusMana += gain;
+                guardian->SetMaxPower(POWER_MANA, guardianMaxMana + gain);
+                guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + gain);
+                leeched = true;
+                if (!msg.empty()) msg += ", ";
+                msg += fmt::format("+{} mana", gain);
+            }
+        }
+
+        if (leeched)
+        {
+            guardian->CastSpell(guardian, 18499, true);
+
+            ChatHandler(owner->GetSession()).PSendSysMessage(
+                "{} leeched: {}", guardian->GetName(), msg);
+
+            SendGuardianBonuses(owner, i, s);
+            SaveGuardianSlotToDb(owner, &s, i);
+        }
     }
 }
 
@@ -1597,8 +1760,9 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
     auto trans = CharacterDatabase.BeginTransaction();
     trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
-        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
+        "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
+        "bonus_damage, bonus_health, bonus_mana, bonus_armor, bonus_haste, bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1612,7 +1776,18 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         slotData->equipmentId,
         slotData->powerChosen ? 1 : 0,
         slotData->rangedDps ? 1 : 0,
-        slotData->dismissed ? 1 : 0
+        slotData->dismissed ? 1 : 0,
+        slotData->bonusDamage,
+        slotData->bonusHealth,
+        slotData->bonusMana,
+        slotData->bonusArmor,
+        slotData->bonusHaste,
+        slotData->bonusResHoly,
+        slotData->bonusResFire,
+        slotData->bonusResNature,
+        slotData->bonusResFrost,
+        slotData->bonusResShadow,
+        slotData->bonusResArcane
     );
     CharacterDatabase.CommitTransaction(trans);
     slotData->savedToDb = true;
@@ -1633,7 +1808,8 @@ static void LoadGuardiansFromDb(Player* player)
     uint32 ownerGuid = player->GetGUID().GetCounter();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed "
+        "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
+        "bonus_damage, bonus_health, bonus_mana, bonus_armor, bonus_haste, bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
@@ -1663,6 +1839,17 @@ static void LoadGuardiansFromDb(Player* player)
         s.powerChosen       = fields[10].Get<uint8>() != 0;
         s.rangedDps         = fields[11].Get<uint8>() != 0;
         s.dismissed         = fields[12].Get<uint8>() != 0;
+        s.bonusDamage       = fields[13].Get<float>();
+        s.bonusHealth       = fields[14].Get<uint32>();
+        s.bonusMana         = fields[15].Get<uint32>();
+        s.bonusArmor        = fields[16].Get<uint32>();
+        s.bonusHaste        = fields[17].Get<float>();
+        s.bonusResHoly      = fields[18].Get<int32>();
+        s.bonusResFire      = fields[19].Get<int32>();
+        s.bonusResNature    = fields[20].Get<int32>();
+        s.bonusResFrost     = fields[21].Get<int32>();
+        s.bonusResShadow    = fields[22].Get<int32>();
+        s.bonusResArcane    = fields[23].Get<int32>();
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -1918,10 +2105,127 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
 
     guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
 
+    // Apply bonus stats from leech/feed if available
+    CapturedGuardianData* bonusData = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    if (slotIndex < MAX_GUARDIAN_SLOTS)
+    {
+        GuardianSlotData& slot = bonusData->slots[slotIndex];
+        if (slot.bonusDamage > 0.0f)
+        {
+            guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
+                guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + slot.bonusDamage);
+            guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
+                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + slot.bonusDamage);
+        }
+        if (slot.bonusHealth > 0)
+        {
+            uint32 newMax = guardian->GetMaxHealth() + slot.bonusHealth;
+            guardian->SetMaxHealth(newMax);
+            guardian->SetHealth(newMax);
+        }
+        if (slot.bonusMana > 0 && guardian->getPowerType() == POWER_MANA)
+        {
+            uint32 newMax = guardian->GetMaxPower(POWER_MANA) + slot.bonusMana;
+            guardian->SetMaxPower(POWER_MANA, newMax);
+            guardian->SetPower(POWER_MANA, newMax);
+        }
+        if (slot.bonusArmor > 0)
+            guardian->SetArmor(guardian->GetArmor() + slot.bonusArmor);
+        if (slot.bonusHaste > 0.0f)
+        {
+            guardian->ApplyAttackTimePercentMod(BASE_ATTACK, slot.bonusHaste, true);
+            guardian->ApplyCastTimePercentMod(slot.bonusHaste, true);
+        }
+        if (slot.bonusResHoly > 0)
+            guardian->SetResistance(SPELL_SCHOOL_HOLY,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_HOLY)) + slot.bonusResHoly);
+        if (slot.bonusResFire > 0)
+            guardian->SetResistance(SPELL_SCHOOL_FIRE,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_FIRE)) + slot.bonusResFire);
+        if (slot.bonusResNature > 0)
+            guardian->SetResistance(SPELL_SCHOOL_NATURE,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_NATURE)) + slot.bonusResNature);
+        if (slot.bonusResFrost > 0)
+            guardian->SetResistance(SPELL_SCHOOL_FROST,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_FROST)) + slot.bonusResFrost);
+        if (slot.bonusResShadow > 0)
+            guardian->SetResistance(SPELL_SCHOOL_SHADOW,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_SHADOW)) + slot.bonusResShadow);
+        if (slot.bonusResArcane > 0)
+            guardian->SetResistance(SPELL_SCHOOL_ARCANE,
+                static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_ARCANE)) + slot.bonusResArcane);
+    }
+
     // Install archetype-driven AI
     guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex, rangedDps));
 
     return guardian;
+}
+
+// ============================================================================
+// Item Feeding — Extract bonus stats from equipment at 50%
+// ============================================================================
+
+static void ExtractItemBonuses(ItemTemplate const* item, GuardianSlotData& s)
+{
+    // Armor at 50%
+    s.bonusArmor += item->Armor / 2;
+
+    // Stat array
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+    {
+        int32 val = item->ItemStat[i].ItemStatValue;
+        if (val <= 0)
+            continue;
+
+        switch (item->ItemStat[i].ItemStatType)
+        {
+            case ITEM_MOD_STAMINA:
+                s.bonusHealth += val * 5; // 10HP/stam * 50%
+                break;
+            case ITEM_MOD_HEALTH:
+                s.bonusHealth += val / 2;
+                break;
+            case ITEM_MOD_INTELLECT:
+                s.bonusMana += val * 15 / 2;
+                break;
+            case ITEM_MOD_MANA:
+                s.bonusMana += val / 2;
+                break;
+            case ITEM_MOD_STRENGTH:
+            case ITEM_MOD_AGILITY:
+            case ITEM_MOD_ATTACK_POWER:
+            case ITEM_MOD_RANGED_ATTACK_POWER:
+            case ITEM_MOD_SPELL_POWER:
+                s.bonusDamage += val * 0.25f;
+                break;
+            case ITEM_MOD_HASTE_RATING:
+            case ITEM_MOD_HASTE_MELEE_RATING:
+            case ITEM_MOD_HASTE_RANGED_RATING:
+            case ITEM_MOD_HASTE_SPELL_RATING:
+                s.bonusHaste += (val * 0.5f) / 32.79f;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Resistances at 50%
+    s.bonusResHoly   += item->HolyRes / 2;
+    s.bonusResFire   += item->FireRes / 2;
+    s.bonusResNature += item->NatureRes / 2;
+    s.bonusResFrost  += item->FrostRes / 2;
+    s.bonusResShadow += item->ShadowRes / 2;
+    s.bonusResArcane += item->ArcaneRes / 2;
+
+    // Weapon damage at 50%
+    if (item->Class == ITEM_CLASS_WEAPON)
+    {
+        float avgDmg = 0;
+        for (uint8 d = 0; d < MAX_ITEM_PROTO_DAMAGES; ++d)
+            avgDmg += (item->Damage[d].DamageMin + item->Damage[d].DamageMax) / 2.0f;
+        s.bonusDamage += avgDmg * 0.5f;
+    }
 }
 
 // ============================================================================
@@ -1958,6 +2262,8 @@ public:
             { "spawn",      HandleSpawnCommand,      SEC_GAMEMASTER,    Console::No },
             { "teach",      HandleTeachCommand,      SEC_PLAYER,        Console::No },
             { "unlearn",    HandleUnlearnCommand,    SEC_PLAYER,        Console::No },
+            { "feed",       HandleFeedCommand,       SEC_PLAYER,        Console::No },
+            { "feedpreview", HandleFeedPreviewCommand, SEC_PLAYER,       Console::No },
         };
 
         static ChatCommandTable commandTable =
@@ -2148,6 +2454,38 @@ public:
             handler->PSendSysMessage("Resource: {} ({})", PowerTypeName(s.guardianPowerType),
                 s.powerChosen ? "chosen" : "default");
             handler->PSendSysMessage("Status: {}", s.IsActive() ? "Active" : "Stored");
+
+            // Bonus stats
+            bool anyBonus = s.bonusDamage > 0.0f || s.bonusHealth > 0 || s.bonusMana > 0 ||
+                            s.bonusArmor > 0 || s.bonusHaste > 0.0f ||
+                            s.bonusResHoly > 0 || s.bonusResFire > 0 || s.bonusResNature > 0 ||
+                            s.bonusResFrost > 0 || s.bonusResShadow > 0 || s.bonusResArcane > 0;
+            if (anyBonus)
+            {
+                handler->PSendSysMessage("--- Bonus Stats ---");
+                if (s.bonusDamage > 0.0f)
+                    handler->PSendSysMessage("  Damage: +{:.1f}", s.bonusDamage);
+                if (s.bonusHealth > 0)
+                    handler->PSendSysMessage("  Health: +{}", s.bonusHealth);
+                if (s.bonusMana > 0)
+                    handler->PSendSysMessage("  Mana: +{}", s.bonusMana);
+                if (s.bonusArmor > 0)
+                    handler->PSendSysMessage("  Armor: +{}", s.bonusArmor);
+                if (s.bonusHaste > 0.0f)
+                    handler->PSendSysMessage("  Haste: +{:.2f}%", s.bonusHaste);
+                if (s.bonusResHoly > 0)
+                    handler->PSendSysMessage("  Holy Res: +{}", s.bonusResHoly);
+                if (s.bonusResFire > 0)
+                    handler->PSendSysMessage("  Fire Res: +{}", s.bonusResFire);
+                if (s.bonusResNature > 0)
+                    handler->PSendSysMessage("  Nature Res: +{}", s.bonusResNature);
+                if (s.bonusResFrost > 0)
+                    handler->PSendSysMessage("  Frost Res: +{}", s.bonusResFrost);
+                if (s.bonusResShadow > 0)
+                    handler->PSendSysMessage("  Shadow Res: +{}", s.bonusResShadow);
+                if (s.bonusResArcane > 0)
+                    handler->PSendSysMessage("  Arcane Res: +{}", s.bonusResArcane);
+            }
         }
         else
         {
@@ -2331,6 +2669,196 @@ public:
 
         return true;
     }
+
+    static bool HandleFeedCommand(ChatHandler* handler, uint32 itemEntry)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player)
+            return false;
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        int8 guardianSlot = FindTargetedGuardianSlot(player, data);
+
+        if (guardianSlot < 0)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Target one of your guardians first.");
+            return true;
+        }
+
+        GuardianSlotData& s = data->slots[guardianSlot];
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+        if (!proto)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Item does not exist.");
+            return true;
+        }
+
+        // Must be equipment (weapon, armor, jewelry)
+        if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Only weapons and armor can be fed to guardians.");
+            return true;
+        }
+
+        // Find the item in player's inventory
+        Item* item = player->GetItemByEntry(itemEntry);
+        if (!item)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r You don't have that item.");
+            return true;
+        }
+
+        // Level check: item RequiredLevel within 15 of guardian level
+        if (proto->RequiredLevel > 0 &&
+            static_cast<int32>(proto->RequiredLevel) > static_cast<int32>(s.guardianLevel) + 15)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Item level requirement too high for this guardian.");
+            return true;
+        }
+
+        std::string itemName = proto->Name1;
+
+        // Snapshot old bonuses to compute delta for live guardian
+        float oldDmg = s.bonusDamage;
+        uint32 oldHP = s.bonusHealth;
+        uint32 oldMana = s.bonusMana;
+        uint32 oldArmor = s.bonusArmor;
+        float oldHaste = s.bonusHaste;
+        int32 oldResH = s.bonusResHoly, oldResF = s.bonusResFire, oldResN = s.bonusResNature;
+        int32 oldResFr = s.bonusResFrost, oldResS = s.bonusResShadow, oldResA = s.bonusResArcane;
+
+        ExtractItemBonuses(proto, s);
+
+        // Destroy one copy of the item
+        player->DestroyItemCount(itemEntry, 1, true);
+
+        // Apply delta to live guardian if summoned
+        if (s.IsActive())
+        {
+            Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
+            if (guardian && guardian->IsAlive())
+            {
+                float dmgDelta = s.bonusDamage - oldDmg;
+                if (dmgDelta > 0.0f)
+                {
+                    guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
+                        guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + dmgDelta);
+                    guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
+                        guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + dmgDelta);
+                }
+                uint32 hpDelta = s.bonusHealth - oldHP;
+                if (hpDelta > 0)
+                {
+                    guardian->SetMaxHealth(guardian->GetMaxHealth() + hpDelta);
+                    guardian->SetHealth(guardian->GetHealth() + hpDelta);
+                }
+                uint32 manaDelta = s.bonusMana - oldMana;
+                if (manaDelta > 0 && guardian->getPowerType() == POWER_MANA)
+                {
+                    guardian->SetMaxPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA) + manaDelta);
+                    guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + static_cast<int32>(manaDelta));
+                }
+                uint32 armorDelta = s.bonusArmor - oldArmor;
+                if (armorDelta > 0)
+                    guardian->SetArmor(guardian->GetArmor() + armorDelta);
+                float hasteDelta = s.bonusHaste - oldHaste;
+                if (hasteDelta > 0.0f)
+                {
+                    guardian->ApplyAttackTimePercentMod(BASE_ATTACK, hasteDelta, true);
+                    guardian->ApplyCastTimePercentMod(hasteDelta, true);
+                }
+                int32 resHDelta = s.bonusResHoly - oldResH;
+                if (resHDelta > 0) guardian->SetResistance(SPELL_SCHOOL_HOLY, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_HOLY)) + resHDelta);
+                int32 resFDelta = s.bonusResFire - oldResF;
+                if (resFDelta > 0) guardian->SetResistance(SPELL_SCHOOL_FIRE, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_FIRE)) + resFDelta);
+                int32 resNDelta = s.bonusResNature - oldResN;
+                if (resNDelta > 0) guardian->SetResistance(SPELL_SCHOOL_NATURE, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_NATURE)) + resNDelta);
+                int32 resFrDelta = s.bonusResFrost - oldResFr;
+                if (resFrDelta > 0) guardian->SetResistance(SPELL_SCHOOL_FROST, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_FROST)) + resFrDelta);
+                int32 resSDelta = s.bonusResShadow - oldResS;
+                if (resSDelta > 0) guardian->SetResistance(SPELL_SCHOOL_SHADOW, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_SHADOW)) + resSDelta);
+                int32 resADelta = s.bonusResArcane - oldResA;
+                if (resADelta > 0) guardian->SetResistance(SPELL_SCHOOL_ARCANE, static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_ARCANE)) + resADelta);
+            }
+        }
+
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(guardianSlot));
+        SendGuardianBonuses(player, static_cast<uint8>(guardianSlot), s);
+
+        handler->PSendSysMessage("|cff00ff00[Guardian]|r Fed {} to guardian in slot {}.", itemName, guardianSlot + 1);
+
+        return true;
+    }
+
+    static bool HandleFeedPreviewCommand(ChatHandler* handler, uint32 itemEntry)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player)
+            return false;
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        int8 guardianSlot = FindTargetedGuardianSlot(player, data);
+
+        if (guardianSlot < 0)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Target one of your guardians first.");
+            return true;
+        }
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+        if (!proto)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Item does not exist.");
+            return true;
+        }
+
+        if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Only weapons and armor can be fed to guardians.");
+            return true;
+        }
+
+        if (!player->GetItemByEntry(itemEntry))
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r You don't have that item.");
+            return true;
+        }
+
+        GuardianSlotData& s = data->slots[guardianSlot];
+
+        if (proto->RequiredLevel > 0 &&
+            static_cast<int32>(proto->RequiredLevel) > static_cast<int32>(s.guardianLevel) + 15)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Item level requirement too high for this guardian.");
+            return true;
+        }
+
+        // Compute preview by extracting into a temporary slot copy
+        GuardianSlotData preview;
+        memset(&preview, 0, sizeof(preview));
+        ExtractItemBonuses(proto, preview);
+
+        // Send FEEDPREVIEW addon message:
+        // FEEDPREVIEW:<slot>:<itemEntry>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+        std::ostringstream ss;
+        ss << ADDON_PREFIX << "\tFEEDPREVIEW:" << (uint32)guardianSlot
+           << ":" << itemEntry
+           << ":" << std::fixed << std::setprecision(1) << preview.bonusDamage
+           << ":" << preview.bonusHealth
+           << ":" << preview.bonusMana
+           << ":" << preview.bonusArmor
+           << ":" << std::fixed << std::setprecision(2) << preview.bonusHaste
+           << ":" << preview.bonusResHoly
+           << ":" << preview.bonusResFire
+           << ":" << preview.bonusResNature
+           << ":" << preview.bonusResFrost
+           << ":" << preview.bonusResShadow
+           << ":" << preview.bonusResArcane;
+        SendCaptureAddonMessage(player, ss.str());
+
+        return true;
+    }
 };
 
 // ============================================================================
@@ -2346,7 +2874,8 @@ public:
         PLAYERHOOK_ON_UPDATE,
         PLAYERHOOK_ON_BEFORE_TELEPORT,
         PLAYERHOOK_ON_MAP_CHANGED,
-        PLAYERHOOK_ON_LEVEL_CHANGED
+        PLAYERHOOK_ON_LEVEL_CHANGED,
+        PLAYERHOOK_ON_CREATURE_KILL
     }) {}
 
     void OnPlayerLogin(Player* player) override
@@ -2545,6 +3074,14 @@ public:
         // Re-summon guardians that were temporarily despawned for map change
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
             SummonGuardianSlot(player, i, false);
+    }
+
+    void OnPlayerCreatureKill(Player* player, Creature* killed) override
+    {
+        if (!config.enabled || !player || !killed)
+            return;
+
+        TryLeechFromKill(player, killed);
     }
 };
 

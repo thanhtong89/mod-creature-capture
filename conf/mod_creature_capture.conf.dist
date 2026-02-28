@@ -45,3 +45,11 @@ CreatureCapture.DamagePct = 100
 # Maximum number of guardian slots per player (1-4)
 # Default: 4
 CreatureCapture.MaxSlots = 4
+
+# Chance (%) per kill for each guardian to leech stats from killed mob
+# Default: 10
+CreatureCapture.LeechChance = 10
+
+# Percentage of mob's stat to leech on success
+# Default: 2
+CreatureCapture.LeechPct = 2
