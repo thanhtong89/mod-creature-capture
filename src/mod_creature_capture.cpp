@@ -2271,28 +2271,38 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
 
     uint32 duration = config.guardianDuration > 0 ? config.guardianDuration * IN_MILLISECONDS : 0;
 
-    TempSummon* guardian = player->SummonCreature(
-        entry, x, y, z, player->GetOrientation(),
-        TEMPSUMMON_MANUAL_DESPAWN, duration
-    );
-
-    if (!guardian)
+    Map* map = player->FindMap();
+    if (!map)
         return nullptr;
 
+    // Manually create the TempSummon so we can set the level and all
+    // properties BEFORE AddToMap.  This way the client's first CREATE
+    // packet already contains the correct level — no UPDATE packet with
+    // a level change means no level-up "ding" effect.
+    TempSummon* guardian = new TempSummon(nullptr, player->GetGUID());
+
+    Position pos(x, y, z, player->GetOrientation());
+    if (!guardian->Create(map->GenerateLowGuid<HighGuid::Unit>(), map,
+            player->GetPhaseMask(), entry, 0, x, y, z, player->GetOrientation()))
+    {
+        delete guardian;
+        return nullptr;
+    }
+
+    guardian->SetHomePosition(pos);
+    guardian->InitStats(duration);
+    guardian->SetTempSummonType(TEMPSUMMON_MANUAL_DESPAWN);
+
+    // --- Set all properties before the creature enters the world ---
     guardian->SetOwnerGUID(player->GetGUID());
     guardian->SetCreatorGUID(player->GetGUID());
     guardian->SetFaction(player->GetFaction());
-    guardian->SetLevel(level, false);
+    guardian->SetLevel(level);
 
     guardian->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_ATTACKABLE_1);
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
     guardian->SetFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP);
     guardian->SetReactState(REACT_DEFENSIVE);
-
-    // Clear any inherited threat/combat state from the creature template
-    guardian->GetThreatMgr().ClearAllThreat();
-    guardian->CombatStop(true);
-    guardian->GetMotionMaster()->Clear();
 
     if (config.healthPct != 100)
     {
@@ -2317,8 +2327,6 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
 
     if (equipmentId > 0)
         guardian->LoadEquipment(equipmentId, true);
-
-    guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
 
     // Apply on-summon bonus stats (damage/crit/dodge/parry are handled by UnitScript hooks)
     CapturedGuardianData* bonusData = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
@@ -2376,6 +2384,21 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
             guardian->SetResistance(SPELL_SCHOOL_ARCANE,
                 static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_ARCANE)) + slot.bonusResArcane);
     }
+
+    // --- Now add to the world — the CREATE packet has all correct values ---
+    if (!map->AddToMap(guardian->ToCreature(), true))
+    {
+        delete guardian;
+        return nullptr;
+    }
+
+    guardian->InitSummon();
+
+    // Clear any inherited threat/combat state from the creature template
+    guardian->GetThreatMgr().ClearAllThreat();
+    guardian->CombatStop(true);
+    guardian->GetMotionMaster()->Clear();
+    guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
 
     // Install archetype-driven AI
     guardian->SetAI(new CapturedGuardianAI(guardian, archetype, spells, slotIndex, rangedDps));
