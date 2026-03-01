@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS `character_guardian` (
     `bonus_hit_rating` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Hit Rating',
     `bonus_arpen_rating` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Armor Penetration Rating',
     `bonus_expertise_rating` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Expertise Rating',
+    `bonus_block_rating` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Block Rating',
+    `bonus_block_value` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Block Value from shields',
     `bonus_armor` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Armor',
     `bonus_weapon_dmg` FLOAT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus weapon damage from fed weapons',
     `bonus_res_holy` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Holy resistance',
@@ -74,4 +76,9 @@ PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Drop old columns after migration
 SET @sql = IF(@have_old_bonus_damage > 0, "ALTER TABLE `character_guardian` DROP COLUMN `bonus_damage`, DROP COLUMN `bonus_health`, DROP COLUMN `bonus_mana`, DROP COLUMN `bonus_haste`", 'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Migration: add block rating and block value columns
+SET @have_block_rating = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'character_guardian' AND COLUMN_NAME = 'bonus_block_rating');
+SET @sql = IF(@have_block_rating = 0, "ALTER TABLE `character_guardian` ADD COLUMN `bonus_block_rating` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Block Rating' AFTER `bonus_expertise_rating`, ADD COLUMN `bonus_block_value` INT NOT NULL DEFAULT 0 COMMENT 'Accumulated bonus Block Value from shields' AFTER `bonus_block_rating`", 'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

@@ -27,6 +27,7 @@ local function NewGuardianData()
         bonusAP = 0, bonusSP = 0,
         bonusCritR = 0, bonusDodgeR = 0, bonusParryR = 0,
         bonusHasteR = 0, bonusHitR = 0,
+        bonusBlockR = 0, bonusBlockV = 0,
         bonusArmor = 0, bonusWeapDmg = 0,
         bonusResHoly = 0, bonusResFire = 0, bonusResNature = 0,
         bonusResFrost = 0, bonusResShadow = 0, bonusResArcane = 0,
@@ -687,7 +688,7 @@ local function ParseEntry(payload)
 end
 
 local function ParseBonus(payload)
-    -- BONUS:<slot>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    -- BONUS:<slot>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<blockR>:<blockV>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
     local parts = {strsplit(":", payload)}
     local slot = tonumber(parts[2])
     if not slot or slot < 0 or slot >= MAX_SLOTS then return end
@@ -704,14 +705,16 @@ local function ParseBonus(payload)
     g.bonusParryR    = tonumber(parts[11]) or 0
     g.bonusHasteR    = tonumber(parts[12]) or 0
     g.bonusHitR      = tonumber(parts[13]) or 0
-    g.bonusArmor     = tonumber(parts[14]) or 0
-    g.bonusWeapDmg   = tonumber(parts[15]) or 0
-    g.bonusResHoly   = tonumber(parts[16]) or 0
-    g.bonusResFire   = tonumber(parts[17]) or 0
-    g.bonusResNature = tonumber(parts[18]) or 0
-    g.bonusResFrost  = tonumber(parts[19]) or 0
-    g.bonusResShadow = tonumber(parts[20]) or 0
-    g.bonusResArcane = tonumber(parts[21]) or 0
+    g.bonusBlockR    = tonumber(parts[14]) or 0
+    g.bonusBlockV    = tonumber(parts[15]) or 0
+    g.bonusArmor     = tonumber(parts[16]) or 0
+    g.bonusWeapDmg   = tonumber(parts[17]) or 0
+    g.bonusResHoly   = tonumber(parts[18]) or 0
+    g.bonusResFire   = tonumber(parts[19]) or 0
+    g.bonusResNature = tonumber(parts[20]) or 0
+    g.bonusResFrost  = tonumber(parts[21]) or 0
+    g.bonusResShadow = tonumber(parts[22]) or 0
+    g.bonusResArcane = tonumber(parts[23]) or 0
 
     RefreshGuardianFrames()
 end
@@ -736,6 +739,8 @@ local function BuildFeedPreviewText(itemLink, guardName, preview)
     if preview.parryR > 0 then table.insert(lines, "  +" .. preview.parryR .. " Parry Rating"); any = true end
     if preview.hasteR > 0 then table.insert(lines, "  +" .. preview.hasteR .. " Haste Rating"); any = true end
     if preview.hitR > 0 then table.insert(lines, "  +" .. preview.hitR .. " Hit Rating"); any = true end
+    if preview.blockR > 0 then table.insert(lines, "  +" .. preview.blockR .. " Block Rating"); any = true end
+    if preview.blockV > 0 then table.insert(lines, "  +" .. preview.blockV .. " Block Value"); any = true end
     if preview.armor > 0 then table.insert(lines, "  +" .. preview.armor .. " Armor"); any = true end
     if preview.weapDmg > 0 then table.insert(lines, string.format("  +%.1f Weapon Damage", preview.weapDmg)); any = true end
     if preview.resHoly > 0 then table.insert(lines, "  +" .. preview.resHoly .. " Holy Res"); any = true end
@@ -751,7 +756,7 @@ local function BuildFeedPreviewText(itemLink, guardName, preview)
 end
 
 local function ParseFeedPreview(payload)
-    -- FEEDPREVIEW:<slot>:<itemEntry>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    -- FEEDPREVIEW:<slot>:<itemEntry>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<blockR>:<blockV>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
     local parts = {strsplit(":", payload)}
     local slot = tonumber(parts[2])
     local itemEntry = tonumber(parts[3])
@@ -769,14 +774,16 @@ local function ParseFeedPreview(payload)
         parryR    = tonumber(parts[12]) or 0,
         hasteR    = tonumber(parts[13]) or 0,
         hitR      = tonumber(parts[14]) or 0,
-        armor     = tonumber(parts[15]) or 0,
-        weapDmg   = tonumber(parts[16]) or 0,
-        resHoly   = tonumber(parts[17]) or 0,
-        resFire   = tonumber(parts[18]) or 0,
-        resNature = tonumber(parts[19]) or 0,
-        resFrost  = tonumber(parts[20]) or 0,
-        resShadow = tonumber(parts[21]) or 0,
-        resArcane = tonumber(parts[22]) or 0,
+        blockR    = tonumber(parts[15]) or 0,
+        blockV    = tonumber(parts[16]) or 0,
+        armor     = tonumber(parts[17]) or 0,
+        weapDmg   = tonumber(parts[18]) or 0,
+        resHoly   = tonumber(parts[19]) or 0,
+        resFire   = tonumber(parts[20]) or 0,
+        resNature = tonumber(parts[21]) or 0,
+        resFrost  = tonumber(parts[22]) or 0,
+        resShadow = tonumber(parts[23]) or 0,
+        resArcane = tonumber(parts[24]) or 0,
     }
 
     local g = guardians[slot]
@@ -1019,6 +1026,14 @@ for i = 0, MAX_SLOTS - 1 do
         end
         if g.bonusHitR and g.bonusHitR > 0 then
             GameTooltip:AddLine("+" .. g.bonusHitR .. " Hit Rating", 0.8, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusBlockR and g.bonusBlockR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusBlockR .. " Block Rating", 0.6, 0.8, 1)
+            hasBonus = true
+        end
+        if g.bonusBlockV and g.bonusBlockV > 0 then
+            GameTooltip:AddLine("+" .. g.bonusBlockV .. " Block Value", 0.6, 0.8, 1)
             hasBonus = true
         end
         if g.bonusArmor and g.bonusArmor > 0 then

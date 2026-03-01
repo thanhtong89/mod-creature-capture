@@ -318,6 +318,8 @@ struct GuardianSlotData
     int32  bonusHitRating   = 0;
     int32  bonusArmorPenRating  = 0;
     int32  bonusExpertiseRating = 0;
+    int32  bonusBlockRating = 0;
+    int32  bonusBlockValue  = 0;
     // Flat
     uint32 bonusArmor       = 0;
     float  bonusWeaponDmg   = 0.0f;
@@ -358,6 +360,8 @@ struct GuardianSlotData
         bonusHitRating = 0;
         bonusArmorPenRating = 0;
         bonusExpertiseRating = 0;
+        bonusBlockRating = 0;
+        bonusBlockValue = 0;
         bonusArmor = 0;
         bonusWeaponDmg = 0.0f;
         bonusResHoly = 0;
@@ -412,6 +416,7 @@ static constexpr float CRIT_RATING_PER_PCT   = 45.91f;
 static constexpr float DODGE_RATING_PER_PCT   = 39.35f;
 static constexpr float PARRY_RATING_PER_PCT   = 49.18f;
 static constexpr float HASTE_RATING_PER_PCT   = 32.79f;
+static constexpr float BLOCK_RATING_PER_PCT   = 16.39f;
 
 static float GetBonusMeleeAP(GuardianSlotData const& s)
 {
@@ -458,6 +463,17 @@ static float GetBonusHastePct(GuardianSlotData const& s)
 {
     return static_cast<float>(s.bonusHasteRating) / HASTE_RATING_PER_PCT;
 }
+
+static float GetBonusBlockPct(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusBlockRating) / BLOCK_RATING_PER_PCT;
+}
+
+// bonusBlockValue is tracked for display and DB persistence.
+// Creature's native GetShieldBlockValue() = level/2 + str/20;
+// bonusStrength flows into that formula naturally.
+// bonusBlockValue (from shield Block field) is not injectable without
+// a core patch, but is shown in .capture info and the addon tooltip.
 
 // Forward declarations for functions used by CapturedGuardianAI
 static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex);
@@ -1671,6 +1687,8 @@ static void SendGuardianBonuses(Player* player, uint8 slot, GuardianSlotData con
        << ":" << s.bonusParryRating
        << ":" << s.bonusHasteRating
        << ":" << s.bonusHitRating
+       << ":" << s.bonusBlockRating
+       << ":" << s.bonusBlockValue
        << ":" << s.bonusArmor
        << ":" << std::fixed << std::setprecision(1) << s.bonusWeaponDmg
        << ":" << s.bonusResHoly
@@ -1863,9 +1881,9 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
         "bonus_strength, bonus_agility, bonus_intellect, bonus_stamina, bonus_attack_power, bonus_spell_power, "
         "bonus_crit_rating, bonus_dodge_rating, bonus_parry_rating, bonus_haste_rating, bonus_hit_rating, "
-        "bonus_arpen_rating, bonus_expertise_rating, bonus_armor, bonus_weapon_dmg, "
+        "bonus_arpen_rating, bonus_expertise_rating, bonus_block_rating, bonus_block_value, bonus_armor, bonus_weapon_dmg, "
         "bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1893,6 +1911,8 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         slotData->bonusHitRating,
         slotData->bonusArmorPenRating,
         slotData->bonusExpertiseRating,
+        slotData->bonusBlockRating,
+        slotData->bonusBlockValue,
         slotData->bonusArmor,
         slotData->bonusWeaponDmg,
         slotData->bonusResHoly,
@@ -1924,7 +1944,7 @@ static void LoadGuardiansFromDb(Player* player)
         "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
         "bonus_strength, bonus_agility, bonus_intellect, bonus_stamina, bonus_attack_power, bonus_spell_power, "
         "bonus_crit_rating, bonus_dodge_rating, bonus_parry_rating, bonus_haste_rating, bonus_hit_rating, "
-        "bonus_arpen_rating, bonus_expertise_rating, bonus_armor, bonus_weapon_dmg, "
+        "bonus_arpen_rating, bonus_expertise_rating, bonus_block_rating, bonus_block_value, bonus_armor, bonus_weapon_dmg, "
         "bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
@@ -1968,14 +1988,16 @@ static void LoadGuardiansFromDb(Player* player)
         s.bonusHitRating    = fields[23].Get<int32>();
         s.bonusArmorPenRating  = fields[24].Get<int32>();
         s.bonusExpertiseRating = fields[25].Get<int32>();
-        s.bonusArmor        = fields[26].Get<uint32>();
-        s.bonusWeaponDmg    = fields[27].Get<float>();
-        s.bonusResHoly      = fields[28].Get<int32>();
-        s.bonusResFire      = fields[29].Get<int32>();
-        s.bonusResNature    = fields[30].Get<int32>();
-        s.bonusResFrost     = fields[31].Get<int32>();
-        s.bonusResShadow    = fields[32].Get<int32>();
-        s.bonusResArcane    = fields[33].Get<int32>();
+        s.bonusBlockRating  = fields[26].Get<int32>();
+        s.bonusBlockValue   = fields[27].Get<int32>();
+        s.bonusArmor        = fields[28].Get<uint32>();
+        s.bonusWeaponDmg    = fields[29].Get<float>();
+        s.bonusResHoly      = fields[30].Get<int32>();
+        s.bonusResFire      = fields[31].Get<int32>();
+        s.bonusResNature    = fields[32].Get<int32>();
+        s.bonusResFrost     = fields[33].Get<int32>();
+        s.bonusResShadow    = fields[34].Get<int32>();
+        s.bonusResArcane    = fields[35].Get<int32>();
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -2363,8 +2385,13 @@ static void ExtractEquipSpellBonuses(ItemTemplate const* item, GuardianSlotData&
                         s.bonusExpertiseRating += bp;
                     if (ratingMask & (1 << CR_ARMOR_PENETRATION))
                         s.bonusArmorPenRating += bp;
+                    if (ratingMask & (1 << CR_BLOCK))
+                        s.bonusBlockRating += bp;
                     break;
                 }
+                case SPELL_AURA_MOD_SHIELD_BLOCKVALUE:
+                    s.bonusBlockValue += bp;
+                    break;
                 case SPELL_AURA_MOD_RESISTANCE:
                 {
                     int32 schoolMask = spellInfo->Effects[eff].MiscValue;
@@ -2456,10 +2483,20 @@ static void ExtractItemBonuses(ItemTemplate const* item, GuardianSlotData& s)
             case ITEM_MOD_EXPERTISE_RATING:
                 s.bonusExpertiseRating += half;
                 break;
+            case ITEM_MOD_BLOCK_RATING:
+                s.bonusBlockRating += half;
+                break;
+            case ITEM_MOD_BLOCK_VALUE:
+                s.bonusBlockValue += half;
+                break;
             default:
                 break;
         }
     }
+
+    // Shield Block value (the Block field on shields) at 50%
+    if (item->Block > 0)
+        s.bonusBlockValue += item->Block / 2;
 
     // Resistances at 50%
     s.bonusResHoly   += item->HolyRes / 2;
@@ -2716,7 +2753,8 @@ public:
                             s.bonusCritRating > 0 || s.bonusDodgeRating > 0 ||
                             s.bonusParryRating > 0 || s.bonusHasteRating > 0 ||
                             s.bonusHitRating > 0 || s.bonusArmorPenRating > 0 ||
-                            s.bonusExpertiseRating > 0 || s.bonusArmor > 0 ||
+                            s.bonusExpertiseRating > 0 || s.bonusBlockRating > 0 ||
+                            s.bonusBlockValue > 0 || s.bonusArmor > 0 ||
                             s.bonusWeaponDmg > 0.0f ||
                             s.bonusResHoly > 0 || s.bonusResFire > 0 || s.bonusResNature > 0 ||
                             s.bonusResFrost > 0 || s.bonusResShadow > 0 || s.bonusResArcane > 0;
@@ -2749,6 +2787,10 @@ public:
                     handler->PSendSysMessage("  Armor Pen: +{}", s.bonusArmorPenRating);
                 if (s.bonusExpertiseRating > 0)
                     handler->PSendSysMessage("  Expertise: +{}", s.bonusExpertiseRating);
+                if (s.bonusBlockRating > 0)
+                    handler->PSendSysMessage("  Block Rating: +{} (+{:.2f}%)", s.bonusBlockRating, GetBonusBlockPct(s));
+                if (s.bonusBlockValue > 0)
+                    handler->PSendSysMessage("  Block Value: +{}", s.bonusBlockValue);
                 if (s.bonusArmor > 0)
                     handler->PSendSysMessage("  Armor: +{}", s.bonusArmor);
                 if (s.bonusWeaponDmg > 0.0f)
@@ -3129,6 +3171,8 @@ public:
            << ":" << preview.bonusParryRating
            << ":" << preview.bonusHasteRating
            << ":" << preview.bonusHitRating
+           << ":" << preview.bonusBlockRating
+           << ":" << preview.bonusBlockValue
            << ":" << preview.bonusArmor
            << ":" << std::fixed << std::setprecision(1) << preview.bonusWeaponDmg
            << ":" << preview.bonusResHoly
@@ -3988,12 +4032,12 @@ public:
             damage += static_cast<uint32>(flatBonus);
     }
 
-    // Melee outcome: adjust crit/dodge/parry chances
+    // Melee outcome: adjust crit/dodge/parry/block chances
     void OnBeforeRollMeleeOutcomeAgainst(Unit const* attacker, Unit const* victim,
         WeaponAttackType /*attType*/, int32& /*attackerMaxSkillValueForLevel*/,
         int32& /*victimMaxSkillValueForLevel*/, int32& /*attackerWeaponSkill*/,
         int32& /*victimDefenseSkill*/, int32& crit_chance, int32& /*miss_chance*/,
-        int32& dodge_chance, int32& parry_chance, int32& /*block_chance*/) override
+        int32& dodge_chance, int32& parry_chance, int32& block_chance) override
     {
         // If attacker is a guardian: boost crit chance
         GuardianSlotData* attackerSlot = FindGuardianSlot(attacker);
@@ -4003,7 +4047,7 @@ public:
             crit_chance += static_cast<int32>(critPct * 100.0f); // units are 0.01%
         }
 
-        // If victim is a guardian: boost dodge/parry chance
+        // If victim is a guardian: boost dodge/parry/block chance
         GuardianSlotData* victimSlot = FindGuardianSlot(victim);
         if (victimSlot)
         {
@@ -4012,6 +4056,9 @@ public:
 
             float parryPct = GetBonusParryPct(*victimSlot);
             parry_chance += static_cast<int32>(parryPct * 100.0f);
+
+            float blockPct = GetBonusBlockPct(*victimSlot);
+            block_chance += static_cast<int32>(blockPct * 100.0f);
         }
     }
 };
