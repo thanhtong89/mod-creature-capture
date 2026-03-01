@@ -11,9 +11,8 @@ CreatureCaptureDB = CreatureCaptureDB or {}
 
 local MAX_SLOTS = 4
 
-local guardians = {}
-for i = 0, MAX_SLOTS - 1 do
-    guardians[i] = {
+local function NewGuardianData()
+    return {
         guardianName = "",
         archetype = 0,  -- 0=DPS, 1=Tank, 2=Healer
         spellSlots = {0, 0, 0, 0, 0, 0, 0, 0},
@@ -23,12 +22,20 @@ for i = 0, MAX_SLOTS - 1 do
         curPow = 0, maxPow = 1,
         powType = 0,
         creatureEntry = 0,
-        -- Bonus stats (leeched + fed)
-        bonusDmg = 0, bonusHP = 0, bonusMana = 0,
-        bonusArmor = 0, bonusHaste = 0,
+        -- Bonus stats (WoW-like stat accumulators)
+        bonusStr = 0, bonusAgi = 0, bonusInt = 0, bonusSta = 0,
+        bonusAP = 0, bonusSP = 0,
+        bonusCritR = 0, bonusDodgeR = 0, bonusParryR = 0,
+        bonusHasteR = 0, bonusHitR = 0,
+        bonusArmor = 0, bonusWeapDmg = 0,
         bonusResHoly = 0, bonusResFire = 0, bonusResNature = 0,
         bonusResFrost = 0, bonusResShadow = 0, bonusResArcane = 0,
     }
+end
+
+local guardians = {}
+for i = 0, MAX_SLOTS - 1 do
+    guardians[i] = NewGuardianData()
 end
 
 local selectedSlot = -1  -- -1 = none selected
@@ -680,23 +687,31 @@ local function ParseEntry(payload)
 end
 
 local function ParseBonus(payload)
-    -- BONUS:<slot>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    -- BONUS:<slot>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
     local parts = {strsplit(":", payload)}
     local slot = tonumber(parts[2])
     if not slot or slot < 0 or slot >= MAX_SLOTS then return end
 
     local g = guardians[slot]
-    g.bonusDmg       = tonumber(parts[3]) or 0
-    g.bonusHP        = tonumber(parts[4]) or 0
-    g.bonusMana      = tonumber(parts[5]) or 0
-    g.bonusArmor     = tonumber(parts[6]) or 0
-    g.bonusHaste     = tonumber(parts[7]) or 0
-    g.bonusResHoly   = tonumber(parts[8]) or 0
-    g.bonusResFire   = tonumber(parts[9]) or 0
-    g.bonusResNature = tonumber(parts[10]) or 0
-    g.bonusResFrost  = tonumber(parts[11]) or 0
-    g.bonusResShadow = tonumber(parts[12]) or 0
-    g.bonusResArcane = tonumber(parts[13]) or 0
+    g.bonusStr       = tonumber(parts[3]) or 0
+    g.bonusAgi       = tonumber(parts[4]) or 0
+    g.bonusInt       = tonumber(parts[5]) or 0
+    g.bonusSta       = tonumber(parts[6]) or 0
+    g.bonusAP        = tonumber(parts[7]) or 0
+    g.bonusSP        = tonumber(parts[8]) or 0
+    g.bonusCritR     = tonumber(parts[9]) or 0
+    g.bonusDodgeR    = tonumber(parts[10]) or 0
+    g.bonusParryR    = tonumber(parts[11]) or 0
+    g.bonusHasteR    = tonumber(parts[12]) or 0
+    g.bonusHitR      = tonumber(parts[13]) or 0
+    g.bonusArmor     = tonumber(parts[14]) or 0
+    g.bonusWeapDmg   = tonumber(parts[15]) or 0
+    g.bonusResHoly   = tonumber(parts[16]) or 0
+    g.bonusResFire   = tonumber(parts[17]) or 0
+    g.bonusResNature = tonumber(parts[18]) or 0
+    g.bonusResFrost  = tonumber(parts[19]) or 0
+    g.bonusResShadow = tonumber(parts[20]) or 0
+    g.bonusResArcane = tonumber(parts[21]) or 0
 
     RefreshGuardianFrames()
 end
@@ -710,26 +725,19 @@ local function BuildFeedPreviewText(itemLink, guardName, preview)
     table.insert(lines, "")
     table.insert(lines, "Expected stat gains:")
     local any = false
-    if preview.dmg > 0 then
-        table.insert(lines, string.format("  +%.1f Damage", preview.dmg))
-        any = true
-    end
-    if preview.hp > 0 then
-        table.insert(lines, "  +" .. preview.hp .. " HP")
-        any = true
-    end
-    if preview.mana > 0 then
-        table.insert(lines, "  +" .. preview.mana .. " Mana")
-        any = true
-    end
-    if preview.armor > 0 then
-        table.insert(lines, "  +" .. preview.armor .. " Armor")
-        any = true
-    end
-    if preview.haste > 0 then
-        table.insert(lines, string.format("  +%.2f%% Haste", preview.haste))
-        any = true
-    end
+    if preview.str > 0 then table.insert(lines, "  +" .. preview.str .. " Strength"); any = true end
+    if preview.agi > 0 then table.insert(lines, "  +" .. preview.agi .. " Agility"); any = true end
+    if preview.int > 0 then table.insert(lines, "  +" .. preview.int .. " Intellect"); any = true end
+    if preview.sta > 0 then table.insert(lines, "  +" .. preview.sta .. " Stamina"); any = true end
+    if preview.ap > 0 then table.insert(lines, "  +" .. preview.ap .. " Attack Power"); any = true end
+    if preview.sp > 0 then table.insert(lines, "  +" .. preview.sp .. " Spell Power"); any = true end
+    if preview.critR > 0 then table.insert(lines, "  +" .. preview.critR .. " Crit Rating"); any = true end
+    if preview.dodgeR > 0 then table.insert(lines, "  +" .. preview.dodgeR .. " Dodge Rating"); any = true end
+    if preview.parryR > 0 then table.insert(lines, "  +" .. preview.parryR .. " Parry Rating"); any = true end
+    if preview.hasteR > 0 then table.insert(lines, "  +" .. preview.hasteR .. " Haste Rating"); any = true end
+    if preview.hitR > 0 then table.insert(lines, "  +" .. preview.hitR .. " Hit Rating"); any = true end
+    if preview.armor > 0 then table.insert(lines, "  +" .. preview.armor .. " Armor"); any = true end
+    if preview.weapDmg > 0 then table.insert(lines, string.format("  +%.1f Weapon Damage", preview.weapDmg)); any = true end
     if preview.resHoly > 0 then table.insert(lines, "  +" .. preview.resHoly .. " Holy Res"); any = true end
     if preview.resFire > 0 then table.insert(lines, "  +" .. preview.resFire .. " Fire Res"); any = true end
     if preview.resNature > 0 then table.insert(lines, "  +" .. preview.resNature .. " Nature Res"); any = true end
@@ -743,24 +751,32 @@ local function BuildFeedPreviewText(itemLink, guardName, preview)
 end
 
 local function ParseFeedPreview(payload)
-    -- FEEDPREVIEW:<slot>:<itemEntry>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+    -- FEEDPREVIEW:<slot>:<itemEntry>:<str>:<agi>:<int>:<sta>:<ap>:<sp>:<critR>:<dodgeR>:<parryR>:<hasteR>:<hitR>:<armor>:<weapDmg>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
     local parts = {strsplit(":", payload)}
     local slot = tonumber(parts[2])
     local itemEntry = tonumber(parts[3])
     if not slot or not itemEntry then return end
 
     local preview = {
-        dmg       = tonumber(parts[4]) or 0,
-        hp        = tonumber(parts[5]) or 0,
-        mana      = tonumber(parts[6]) or 0,
-        armor     = tonumber(parts[7]) or 0,
-        haste     = tonumber(parts[8]) or 0,
-        resHoly   = tonumber(parts[9]) or 0,
-        resFire   = tonumber(parts[10]) or 0,
-        resNature = tonumber(parts[11]) or 0,
-        resFrost  = tonumber(parts[12]) or 0,
-        resShadow = tonumber(parts[13]) or 0,
-        resArcane = tonumber(parts[14]) or 0,
+        str       = tonumber(parts[4]) or 0,
+        agi       = tonumber(parts[5]) or 0,
+        int       = tonumber(parts[6]) or 0,
+        sta       = tonumber(parts[7]) or 0,
+        ap        = tonumber(parts[8]) or 0,
+        sp        = tonumber(parts[9]) or 0,
+        critR     = tonumber(parts[10]) or 0,
+        dodgeR    = tonumber(parts[11]) or 0,
+        parryR    = tonumber(parts[12]) or 0,
+        hasteR    = tonumber(parts[13]) or 0,
+        hitR      = tonumber(parts[14]) or 0,
+        armor     = tonumber(parts[15]) or 0,
+        weapDmg   = tonumber(parts[16]) or 0,
+        resHoly   = tonumber(parts[17]) or 0,
+        resFire   = tonumber(parts[18]) or 0,
+        resNature = tonumber(parts[19]) or 0,
+        resFrost  = tonumber(parts[20]) or 0,
+        resShadow = tonumber(parts[21]) or 0,
+        resArcane = tonumber(parts[22]) or 0,
     }
 
     local g = guardians[slot]
@@ -781,21 +797,7 @@ local function ParseClear(payload)
     if not slot or slot < 0 or slot >= MAX_SLOTS then return end
 
     -- Fully reset slot
-    guardians[slot] = {
-        guardianName = "",
-        archetype = 0,
-        spellSlots = {0, 0, 0, 0, 0, 0, 0, 0},
-        hasGuardian = false,
-        creatureGuid = nil,
-        curHP = 0, maxHP = 1,
-        curPow = 0, maxPow = 1,
-        powType = 0,
-        creatureEntry = 0,
-        bonusDmg = 0, bonusHP = 0, bonusMana = 0,
-        bonusArmor = 0, bonusHaste = 0,
-        bonusResHoly = 0, bonusResFire = 0, bonusResNature = 0,
-        bonusResFrost = 0, bonusResShadow = 0, bonusResArcane = 0,
-    }
+    guardians[slot] = NewGuardianData()
 
     -- If this was the selected slot, pick another
     if selectedSlot == slot then
@@ -973,26 +975,58 @@ for i = 0, MAX_SLOTS - 1 do
         local archColor = ARCHETYPE_COLORS[g.archetype] or ARCHETYPE_COLORS[0]
         GameTooltip:AddLine(archName, archColor[1], archColor[2], archColor[3])
 
-        -- Bonus stats
+        -- Bonus stats (WoW-like attributes with stat-appropriate colors)
         local hasBonus = false
-        if g.bonusDmg and g.bonusDmg > 0 then
-            GameTooltip:AddLine(string.format("+%.1f Bonus Damage", g.bonusDmg), 1, 0.8, 0)
+        if g.bonusStr and g.bonusStr > 0 then
+            GameTooltip:AddLine("+" .. g.bonusStr .. " Strength", 0.8, 0.2, 0.2)
             hasBonus = true
         end
-        if g.bonusHP and g.bonusHP > 0 then
-            GameTooltip:AddLine("+" .. g.bonusHP .. " Bonus HP", 0, 1, 0)
+        if g.bonusAgi and g.bonusAgi > 0 then
+            GameTooltip:AddLine("+" .. g.bonusAgi .. " Agility", 0.2, 0.8, 0.2)
             hasBonus = true
         end
-        if g.bonusMana and g.bonusMana > 0 then
-            GameTooltip:AddLine("+" .. g.bonusMana .. " Bonus Mana", 0.2, 0.5, 1)
+        if g.bonusInt and g.bonusInt > 0 then
+            GameTooltip:AddLine("+" .. g.bonusInt .. " Intellect", 0.2, 0.5, 1)
+            hasBonus = true
+        end
+        if g.bonusSta and g.bonusSta > 0 then
+            GameTooltip:AddLine("+" .. g.bonusSta .. " Stamina", 1, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusAP and g.bonusAP > 0 then
+            GameTooltip:AddLine("+" .. g.bonusAP .. " Attack Power", 0.8, 0.2, 0.2)
+            hasBonus = true
+        end
+        if g.bonusSP and g.bonusSP > 0 then
+            GameTooltip:AddLine("+" .. g.bonusSP .. " Spell Power", 0.5, 0.3, 1)
+            hasBonus = true
+        end
+        if g.bonusCritR and g.bonusCritR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusCritR .. " Crit Rating", 1, 0.5, 0)
+            hasBonus = true
+        end
+        if g.bonusDodgeR and g.bonusDodgeR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusDodgeR .. " Dodge Rating", 0.6, 0.8, 0.6)
+            hasBonus = true
+        end
+        if g.bonusParryR and g.bonusParryR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusParryR .. " Parry Rating", 0.6, 0.8, 0.6)
+            hasBonus = true
+        end
+        if g.bonusHasteR and g.bonusHasteR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusHasteR .. " Haste Rating", 0.8, 0.8, 0)
+            hasBonus = true
+        end
+        if g.bonusHitR and g.bonusHitR > 0 then
+            GameTooltip:AddLine("+" .. g.bonusHitR .. " Hit Rating", 0.8, 0.8, 0)
             hasBonus = true
         end
         if g.bonusArmor and g.bonusArmor > 0 then
-            GameTooltip:AddLine("+" .. g.bonusArmor .. " Bonus Armor", 1, 1, 0)
+            GameTooltip:AddLine("+" .. g.bonusArmor .. " Armor", 1, 1, 0)
             hasBonus = true
         end
-        if g.bonusHaste and g.bonusHaste > 0 then
-            GameTooltip:AddLine(string.format("+%.2f%% Haste", g.bonusHaste), 0.8, 0.8, 0)
+        if g.bonusWeapDmg and g.bonusWeapDmg > 0 then
+            GameTooltip:AddLine(string.format("+%.1f Weapon Damage", g.bonusWeapDmg), 1, 0.8, 0)
             hasBonus = true
         end
         if g.bonusResHoly and g.bonusResHoly > 0 then

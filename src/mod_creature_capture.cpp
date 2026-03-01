@@ -303,11 +303,25 @@ struct GuardianSlotData
     bool   savedToDb        = false;
 
     // Bonus stats (leeched from kills + fed from items)
-    float  bonusDamage      = 0.0f;
-    uint32 bonusHealth      = 0;
-    uint32 bonusMana        = 0;
+    // Primary stats
+    int32  bonusStrength    = 0;
+    int32  bonusAgility     = 0;
+    int32  bonusIntellect   = 0;
+    int32  bonusStamina     = 0;
+    // Secondary ratings
+    int32  bonusAttackPower = 0;
+    int32  bonusSpellPower  = 0;
+    int32  bonusCritRating  = 0;
+    int32  bonusDodgeRating = 0;
+    int32  bonusParryRating = 0;
+    int32  bonusHasteRating = 0;
+    int32  bonusHitRating   = 0;
+    int32  bonusArmorPenRating  = 0;
+    int32  bonusExpertiseRating = 0;
+    // Flat
     uint32 bonusArmor       = 0;
-    float  bonusHaste       = 0.0f;
+    float  bonusWeaponDmg   = 0.0f;
+    // Resistances
     int32  bonusResHoly     = 0;
     int32  bonusResFire     = 0;
     int32  bonusResNature   = 0;
@@ -331,11 +345,21 @@ struct GuardianSlotData
         rangedDps = false;
         dismissed = false;
         savedToDb = false;
-        bonusDamage = 0.0f;
-        bonusHealth = 0;
-        bonusMana = 0;
+        bonusStrength = 0;
+        bonusAgility = 0;
+        bonusIntellect = 0;
+        bonusStamina = 0;
+        bonusAttackPower = 0;
+        bonusSpellPower = 0;
+        bonusCritRating = 0;
+        bonusDodgeRating = 0;
+        bonusParryRating = 0;
+        bonusHasteRating = 0;
+        bonusHitRating = 0;
+        bonusArmorPenRating = 0;
+        bonusExpertiseRating = 0;
         bonusArmor = 0;
-        bonusHaste = 0.0f;
+        bonusWeaponDmg = 0.0f;
         bonusResHoly = 0;
         bonusResFire = 0;
         bonusResNature = 0;
@@ -378,6 +402,62 @@ public:
         return -1;
     }
 };
+
+// ============================================================================
+// Derived Stat Helpers — convert raw stat accumulators into combat values
+// ============================================================================
+
+// Rating conversion constants (level 80, WotLK 3.3.5)
+static constexpr float CRIT_RATING_PER_PCT   = 45.91f;
+static constexpr float DODGE_RATING_PER_PCT   = 39.35f;
+static constexpr float PARRY_RATING_PER_PCT   = 49.18f;
+static constexpr float HASTE_RATING_PER_PCT   = 32.79f;
+
+static float GetBonusMeleeAP(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusStrength * 2 + s.bonusAttackPower);
+}
+
+static float GetBonusRangedAP(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusAgility + s.bonusAttackPower);
+}
+
+static float GetBonusSpellPower(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusIntellect + s.bonusSpellPower);
+}
+
+static uint32 GetBonusHealth(GuardianSlotData const& s)
+{
+    return static_cast<uint32>(s.bonusStamina * 10);
+}
+
+static uint32 GetBonusMana(GuardianSlotData const& s)
+{
+    return static_cast<uint32>(s.bonusIntellect * 15);
+}
+
+static float GetBonusCritPct(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusAgility) / 62.5f +
+           static_cast<float>(s.bonusCritRating) / CRIT_RATING_PER_PCT;
+}
+
+static float GetBonusDodgePct(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusDodgeRating) / DODGE_RATING_PER_PCT;
+}
+
+static float GetBonusParryPct(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusParryRating) / PARRY_RATING_PER_PCT;
+}
+
+static float GetBonusHastePct(GuardianSlotData const& s)
+{
+    return static_cast<float>(s.bonusHasteRating) / HASTE_RATING_PER_PCT;
+}
 
 // Forward declarations for functions used by CapturedGuardianAI
 static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex);
@@ -1580,11 +1660,19 @@ static void SendGuardianBonuses(Player* player, uint8 slot, GuardianSlotData con
 {
     std::ostringstream ss;
     ss << ADDON_PREFIX << "\tBONUS:" << (uint32)slot
-       << ":" << std::fixed << std::setprecision(1) << s.bonusDamage
-       << ":" << s.bonusHealth
-       << ":" << s.bonusMana
+       << ":" << s.bonusStrength
+       << ":" << s.bonusAgility
+       << ":" << s.bonusIntellect
+       << ":" << s.bonusStamina
+       << ":" << s.bonusAttackPower
+       << ":" << s.bonusSpellPower
+       << ":" << s.bonusCritRating
+       << ":" << s.bonusDodgeRating
+       << ":" << s.bonusParryRating
+       << ":" << s.bonusHasteRating
+       << ":" << s.bonusHitRating
        << ":" << s.bonusArmor
-       << ":" << std::fixed << std::setprecision(2) << s.bonusHaste
+       << ":" << std::fixed << std::setprecision(1) << s.bonusWeaponDmg
        << ":" << s.bonusResHoly
        << ":" << s.bonusResFire
        << ":" << s.bonusResNature
@@ -1616,11 +1704,17 @@ static void TryLeechFromKill(Player* owner, Creature* killed)
 
     CapturedGuardianData* data = owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
+    // Estimate mob's "effective stats" from combat values
     float mobAvgDmg = (killed->GetFloatValue(UNIT_FIELD_MINDAMAGE) +
                        killed->GetFloatValue(UNIT_FIELD_MAXDAMAGE)) / 2.0f;
     uint32 mobMaxHP = killed->GetMaxHealth();
     uint32 mobMaxMana = (killed->getPowerType() == POWER_MANA)
                         ? killed->GetMaxPower(POWER_MANA) : 0;
+
+    int32 mobEffStr = static_cast<int32>(mobAvgDmg / 2.0f);
+    int32 mobEffAgi = static_cast<int32>(mobAvgDmg / 3.0f);
+    int32 mobEffSta = static_cast<int32>(mobMaxHP / 10);
+    int32 mobEffInt = (mobMaxMana > 0) ? static_cast<int32>(mobMaxMana / 15) : 0;
 
     float leechPct = static_cast<float>(config.leechPct) / 100.0f;
 
@@ -1640,48 +1734,54 @@ static void TryLeechFromKill(Player* owner, Creature* killed)
         bool leeched = false;
         std::string msg;
 
-        // Leech damage
-        float guardianAvgDmg = (guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) +
-                                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE)) / 2.0f;
-        if (guardianAvgDmg < mobAvgDmg)
+        // Leech STR
+        if (s.bonusStrength < mobEffStr)
         {
-            float gain = std::ceil(mobAvgDmg * leechPct * 10.0f) / 10.0f;
-            s.bonusDamage += gain;
-            guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
-                guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + gain);
-            guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
-                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + gain);
+            int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffStr * leechPct)));
+            s.bonusStrength += gain;
             leeched = true;
-            msg += fmt::format("+{:.1f} damage", gain);
+            msg += fmt::format("+{} STR", gain);
         }
 
-        // Leech HP
-        uint32 guardianMaxHP = guardian->GetMaxHealth();
-        if (guardianMaxHP < mobMaxHP)
+        // Leech AGI
+        if (s.bonusAgility < mobEffAgi)
         {
-            uint32 gain = std::max(1u, static_cast<uint32>(std::ceil(mobMaxHP * leechPct)));
-            s.bonusHealth += gain;
-            guardian->SetMaxHealth(guardianMaxHP + gain);
-            guardian->SetHealth(guardian->GetHealth() + gain);
+            int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffAgi * leechPct)));
+            s.bonusAgility += gain;
             leeched = true;
             if (!msg.empty()) msg += ", ";
-            msg += fmt::format("+{} HP", gain);
+            msg += fmt::format("+{} AGI", gain);
         }
 
-        // Leech mana
-        if (mobMaxMana > 0 && guardian->getPowerType() == POWER_MANA)
+        // Leech STA
+        if (s.bonusStamina < mobEffSta)
         {
-            uint32 guardianMaxMana = guardian->GetMaxPower(POWER_MANA);
-            if (guardianMaxMana < mobMaxMana)
+            int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffSta * leechPct)));
+            s.bonusStamina += gain;
+            // Apply STA change to live guardian immediately
+            uint32 hpGain = static_cast<uint32>(gain * 10);
+            guardian->SetMaxHealth(guardian->GetMaxHealth() + hpGain);
+            guardian->SetHealth(guardian->GetHealth() + hpGain);
+            leeched = true;
+            if (!msg.empty()) msg += ", ";
+            msg += fmt::format("+{} STA", gain);
+        }
+
+        // Leech INT
+        if (mobEffInt > 0 && s.bonusIntellect < mobEffInt)
+        {
+            int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffInt * leechPct)));
+            s.bonusIntellect += gain;
+            // Apply INT change to live guardian immediately (mana)
+            if (guardian->getPowerType() == POWER_MANA)
             {
-                uint32 gain = std::max(1u, static_cast<uint32>(std::ceil(mobMaxMana * leechPct)));
-                s.bonusMana += gain;
-                guardian->SetMaxPower(POWER_MANA, guardianMaxMana + gain);
-                guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + gain);
-                leeched = true;
-                if (!msg.empty()) msg += ", ";
-                msg += fmt::format("+{} mana", gain);
+                uint32 manaGain = static_cast<uint32>(gain * 15);
+                guardian->SetMaxPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA) + manaGain);
+                guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + static_cast<int32>(manaGain));
             }
+            leeched = true;
+            if (!msg.empty()) msg += ", ";
+            msg += fmt::format("+{} INT", gain);
         }
 
         if (leeched)
@@ -1761,8 +1861,11 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
     trans->Append("DELETE FROM character_guardian WHERE owner = {} AND slot = {}", ownerGuid, slotIndex);
     trans->Append(
         "INSERT INTO character_guardian (owner, entry, level, slot, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
-        "bonus_damage, bonus_health, bonus_mana, bonus_armor, bonus_haste, bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane, save_time) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
+        "bonus_strength, bonus_agility, bonus_intellect, bonus_stamina, bonus_attack_power, bonus_spell_power, "
+        "bonus_crit_rating, bonus_dodge_rating, bonus_parry_rating, bonus_haste_rating, bonus_hit_rating, "
+        "bonus_arpen_rating, bonus_expertise_rating, bonus_armor, bonus_weapon_dmg, "
+        "bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane, save_time) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, UNIX_TIMESTAMP())",
         ownerGuid,
         slotData->guardianEntry,
         slotData->guardianLevel,
@@ -1777,11 +1880,21 @@ static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uin
         slotData->powerChosen ? 1 : 0,
         slotData->rangedDps ? 1 : 0,
         slotData->dismissed ? 1 : 0,
-        slotData->bonusDamage,
-        slotData->bonusHealth,
-        slotData->bonusMana,
+        slotData->bonusStrength,
+        slotData->bonusAgility,
+        slotData->bonusIntellect,
+        slotData->bonusStamina,
+        slotData->bonusAttackPower,
+        slotData->bonusSpellPower,
+        slotData->bonusCritRating,
+        slotData->bonusDodgeRating,
+        slotData->bonusParryRating,
+        slotData->bonusHasteRating,
+        slotData->bonusHitRating,
+        slotData->bonusArmorPenRating,
+        slotData->bonusExpertiseRating,
         slotData->bonusArmor,
-        slotData->bonusHaste,
+        slotData->bonusWeaponDmg,
         slotData->bonusResHoly,
         slotData->bonusResFire,
         slotData->bonusResNature,
@@ -1809,7 +1922,10 @@ static void LoadGuardiansFromDb(Player* player)
 
     QueryResult result = CharacterDatabase.Query(
         "SELECT slot, entry, level, cur_health, cur_power, power_type, archetype, spells, display_id, equipment_id, power_chosen, ranged_dps, dismissed, "
-        "bonus_damage, bonus_health, bonus_mana, bonus_armor, bonus_haste, bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane "
+        "bonus_strength, bonus_agility, bonus_intellect, bonus_stamina, bonus_attack_power, bonus_spell_power, "
+        "bonus_crit_rating, bonus_dodge_rating, bonus_parry_rating, bonus_haste_rating, bonus_hit_rating, "
+        "bonus_arpen_rating, bonus_expertise_rating, bonus_armor, bonus_weapon_dmg, "
+        "bonus_res_holy, bonus_res_fire, bonus_res_nature, bonus_res_frost, bonus_res_shadow, bonus_res_arcane "
         "FROM character_guardian WHERE owner = {}",
         ownerGuid
     );
@@ -1839,17 +1955,27 @@ static void LoadGuardiansFromDb(Player* player)
         s.powerChosen       = fields[10].Get<uint8>() != 0;
         s.rangedDps         = fields[11].Get<uint8>() != 0;
         s.dismissed         = fields[12].Get<uint8>() != 0;
-        s.bonusDamage       = fields[13].Get<float>();
-        s.bonusHealth       = fields[14].Get<uint32>();
-        s.bonusMana         = fields[15].Get<uint32>();
-        s.bonusArmor        = fields[16].Get<uint32>();
-        s.bonusHaste        = fields[17].Get<float>();
-        s.bonusResHoly      = fields[18].Get<int32>();
-        s.bonusResFire      = fields[19].Get<int32>();
-        s.bonusResNature    = fields[20].Get<int32>();
-        s.bonusResFrost     = fields[21].Get<int32>();
-        s.bonusResShadow    = fields[22].Get<int32>();
-        s.bonusResArcane    = fields[23].Get<int32>();
+        s.bonusStrength     = fields[13].Get<int32>();
+        s.bonusAgility      = fields[14].Get<int32>();
+        s.bonusIntellect    = fields[15].Get<int32>();
+        s.bonusStamina      = fields[16].Get<int32>();
+        s.bonusAttackPower  = fields[17].Get<int32>();
+        s.bonusSpellPower   = fields[18].Get<int32>();
+        s.bonusCritRating   = fields[19].Get<int32>();
+        s.bonusDodgeRating  = fields[20].Get<int32>();
+        s.bonusParryRating  = fields[21].Get<int32>();
+        s.bonusHasteRating  = fields[22].Get<int32>();
+        s.bonusHitRating    = fields[23].Get<int32>();
+        s.bonusArmorPenRating  = fields[24].Get<int32>();
+        s.bonusExpertiseRating = fields[25].Get<int32>();
+        s.bonusArmor        = fields[26].Get<uint32>();
+        s.bonusWeaponDmg    = fields[27].Get<float>();
+        s.bonusResHoly      = fields[28].Get<int32>();
+        s.bonusResFire      = fields[29].Get<int32>();
+        s.bonusResNature    = fields[30].Get<int32>();
+        s.bonusResFrost     = fields[31].Get<int32>();
+        s.bonusResShadow    = fields[32].Get<int32>();
+        s.bonusResArcane    = fields[33].Get<int32>();
         s.savedToDb         = true;
     }
     while (result->NextRow());
@@ -2105,37 +2231,43 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
 
     guardian->GetMotionMaster()->MoveFollow(player, GUARDIAN_FOLLOW_DIST, angle);
 
-    // Apply bonus stats from leech/feed if available
+    // Apply on-summon bonus stats (damage/crit/dodge/parry are handled by UnitScript hooks)
     CapturedGuardianData* bonusData = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
     if (slotIndex < MAX_GUARDIAN_SLOTS)
     {
         GuardianSlotData& slot = bonusData->slots[slotIndex];
-        if (slot.bonusDamage > 0.0f)
+
+        // HP from STA
+        uint32 bonusHP = GetBonusHealth(slot);
+        if (bonusHP > 0)
         {
-            guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
-                guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + slot.bonusDamage);
-            guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
-                guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + slot.bonusDamage);
-        }
-        if (slot.bonusHealth > 0)
-        {
-            uint32 newMax = guardian->GetMaxHealth() + slot.bonusHealth;
+            uint32 newMax = guardian->GetMaxHealth() + bonusHP;
             guardian->SetMaxHealth(newMax);
             guardian->SetHealth(newMax);
         }
-        if (slot.bonusMana > 0 && guardian->getPowerType() == POWER_MANA)
+
+        // Mana from INT
+        uint32 bonusMana = GetBonusMana(slot);
+        if (bonusMana > 0 && guardian->getPowerType() == POWER_MANA)
         {
-            uint32 newMax = guardian->GetMaxPower(POWER_MANA) + slot.bonusMana;
+            uint32 newMax = guardian->GetMaxPower(POWER_MANA) + bonusMana;
             guardian->SetMaxPower(POWER_MANA, newMax);
             guardian->SetPower(POWER_MANA, newMax);
         }
+
+        // Armor
         if (slot.bonusArmor > 0)
             guardian->SetArmor(guardian->GetArmor() + slot.bonusArmor);
-        if (slot.bonusHaste > 0.0f)
+
+        // Haste from rating
+        float hastePct = GetBonusHastePct(slot);
+        if (hastePct > 0.0f)
         {
-            guardian->ApplyAttackTimePercentMod(BASE_ATTACK, slot.bonusHaste, true);
-            guardian->ApplyCastTimePercentMod(slot.bonusHaste, true);
+            guardian->ApplyAttackTimePercentMod(BASE_ATTACK, hastePct, true);
+            guardian->ApplyCastTimePercentMod(hastePct, true);
         }
+
+        // Resistances
         if (slot.bonusResHoly > 0)
             guardian->SetResistance(SPELL_SCHOOL_HOLY,
                 static_cast<int32>(guardian->GetResistance(SPELL_SCHOOL_HOLY)) + slot.bonusResHoly);
@@ -2166,44 +2298,163 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
 // Item Feeding — Extract bonus stats from equipment at 50%
 // ============================================================================
 
+static void ExtractEquipSpellBonuses(ItemTemplate const* item, GuardianSlotData& s)
+{
+    for (uint8 sp = 0; sp < MAX_ITEM_PROTO_SPELLS; ++sp)
+    {
+        if (item->Spells[sp].SpellId <= 0)
+            continue;
+        if (item->Spells[sp].SpellTrigger != ITEM_SPELLTRIGGER_ON_EQUIP)
+            continue;
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(item->Spells[sp].SpellId);
+        if (!spellInfo)
+            continue;
+
+        for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
+        {
+            int32 bp = spellInfo->Effects[eff].BasePoints / 2;
+            if (bp <= 0)
+                continue;
+
+            switch (spellInfo->Effects[eff].ApplyAuraName)
+            {
+                case SPELL_AURA_MOD_STAT:
+                {
+                    int32 misc = spellInfo->Effects[eff].MiscValue;
+                    if (misc == 0)       s.bonusStrength  += bp;
+                    else if (misc == 1)  s.bonusAgility   += bp;
+                    else if (misc == 2)  s.bonusStamina   += bp;
+                    else if (misc == 3)  s.bonusIntellect += bp;
+                    else if (misc == -1) // all stats
+                    {
+                        s.bonusStrength  += bp;
+                        s.bonusAgility   += bp;
+                        s.bonusStamina   += bp;
+                        s.bonusIntellect += bp;
+                    }
+                    break;
+                }
+                case SPELL_AURA_MOD_ATTACK_POWER:
+                    s.bonusAttackPower += bp;
+                    break;
+                case SPELL_AURA_MOD_DAMAGE_DONE:
+                {
+                    // Non-physical schools = spell power
+                    int32 schoolMask = spellInfo->Effects[eff].MiscValue;
+                    if (schoolMask & ~SPELL_SCHOOL_MASK_NORMAL)
+                        s.bonusSpellPower += bp;
+                    break;
+                }
+                case SPELL_AURA_MOD_RATING:
+                {
+                    int32 ratingMask = spellInfo->Effects[eff].MiscValue;
+                    if (ratingMask & (1 << CR_DODGE))
+                        s.bonusDodgeRating += bp;
+                    if (ratingMask & (1 << CR_PARRY))
+                        s.bonusParryRating += bp;
+                    if (ratingMask & (1 << CR_HIT_MELEE))
+                        s.bonusHitRating += bp;
+                    if (ratingMask & (1 << CR_CRIT_MELEE))
+                        s.bonusCritRating += bp;
+                    if (ratingMask & (1 << CR_HASTE_MELEE))
+                        s.bonusHasteRating += bp;
+                    if (ratingMask & (1 << CR_EXPERTISE))
+                        s.bonusExpertiseRating += bp;
+                    if (ratingMask & (1 << CR_ARMOR_PENETRATION))
+                        s.bonusArmorPenRating += bp;
+                    break;
+                }
+                case SPELL_AURA_MOD_RESISTANCE:
+                {
+                    int32 schoolMask = spellInfo->Effects[eff].MiscValue;
+                    if (schoolMask & SPELL_SCHOOL_MASK_HOLY)   s.bonusResHoly   += bp;
+                    if (schoolMask & SPELL_SCHOOL_MASK_FIRE)   s.bonusResFire   += bp;
+                    if (schoolMask & SPELL_SCHOOL_MASK_NATURE) s.bonusResNature += bp;
+                    if (schoolMask & SPELL_SCHOOL_MASK_FROST)  s.bonusResFrost  += bp;
+                    if (schoolMask & SPELL_SCHOOL_MASK_SHADOW) s.bonusResShadow += bp;
+                    if (schoolMask & SPELL_SCHOOL_MASK_ARCANE) s.bonusResArcane += bp;
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+}
+
 static void ExtractItemBonuses(ItemTemplate const* item, GuardianSlotData& s)
 {
     // Armor at 50%
     s.bonusArmor += item->Armor / 2;
 
-    // Stat array
+    // Stat array — map to proper WoW stat accumulators at 50%
     for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
     {
         int32 val = item->ItemStat[i].ItemStatValue;
         if (val <= 0)
             continue;
 
+        int32 half = val / 2;
+
         switch (item->ItemStat[i].ItemStatType)
         {
-            case ITEM_MOD_STAMINA:
-                s.bonusHealth += val * 5; // 10HP/stam * 50%
+            case ITEM_MOD_STRENGTH:
+                s.bonusStrength += half;
                 break;
-            case ITEM_MOD_HEALTH:
-                s.bonusHealth += val / 2;
+            case ITEM_MOD_AGILITY:
+                s.bonusAgility += half;
                 break;
             case ITEM_MOD_INTELLECT:
-                s.bonusMana += val * 15 / 2;
+                s.bonusIntellect += half;
+                break;
+            case ITEM_MOD_STAMINA:
+                s.bonusStamina += half;
+                break;
+            case ITEM_MOD_HEALTH:
+                s.bonusStamina += half / 10; // convert to STA equivalent
                 break;
             case ITEM_MOD_MANA:
-                s.bonusMana += val / 2;
+                s.bonusIntellect += half / 15; // convert to INT equivalent
                 break;
-            case ITEM_MOD_STRENGTH:
-            case ITEM_MOD_AGILITY:
             case ITEM_MOD_ATTACK_POWER:
             case ITEM_MOD_RANGED_ATTACK_POWER:
+                s.bonusAttackPower += half;
+                break;
             case ITEM_MOD_SPELL_POWER:
-                s.bonusDamage += val * 0.25f;
+            case ITEM_MOD_SPELL_HEALING_DONE:
+            case ITEM_MOD_SPELL_DAMAGE_DONE:
+                s.bonusSpellPower += half;
+                break;
+            case ITEM_MOD_CRIT_RATING:
+            case ITEM_MOD_CRIT_MELEE_RATING:
+            case ITEM_MOD_CRIT_RANGED_RATING:
+            case ITEM_MOD_CRIT_SPELL_RATING:
+                s.bonusCritRating += half;
+                break;
+            case ITEM_MOD_DODGE_RATING:
+                s.bonusDodgeRating += half;
+                break;
+            case ITEM_MOD_PARRY_RATING:
+                s.bonusParryRating += half;
                 break;
             case ITEM_MOD_HASTE_RATING:
             case ITEM_MOD_HASTE_MELEE_RATING:
             case ITEM_MOD_HASTE_RANGED_RATING:
             case ITEM_MOD_HASTE_SPELL_RATING:
-                s.bonusHaste += (val * 0.5f) / 32.79f;
+                s.bonusHasteRating += half;
+                break;
+            case ITEM_MOD_HIT_RATING:
+            case ITEM_MOD_HIT_MELEE_RATING:
+            case ITEM_MOD_HIT_RANGED_RATING:
+            case ITEM_MOD_HIT_SPELL_RATING:
+                s.bonusHitRating += half;
+                break;
+            case ITEM_MOD_ARMOR_PENETRATION_RATING:
+                s.bonusArmorPenRating += half;
+                break;
+            case ITEM_MOD_EXPERTISE_RATING:
+                s.bonusExpertiseRating += half;
                 break;
             default:
                 break;
@@ -2224,8 +2475,11 @@ static void ExtractItemBonuses(ItemTemplate const* item, GuardianSlotData& s)
         float avgDmg = 0;
         for (uint8 d = 0; d < MAX_ITEM_PROTO_DAMAGES; ++d)
             avgDmg += (item->Damage[d].DamageMin + item->Damage[d].DamageMax) / 2.0f;
-        s.bonusDamage += avgDmg * 0.5f;
+        s.bonusWeaponDmg += avgDmg * 0.5f;
     }
+
+    // Extract on-equip spell bonuses (e.g. trinkets, set bonuses)
+    ExtractEquipSpellBonuses(item, s);
 }
 
 // ============================================================================
@@ -2456,23 +2710,49 @@ public:
             handler->PSendSysMessage("Status: {}", s.IsActive() ? "Active" : "Stored");
 
             // Bonus stats
-            bool anyBonus = s.bonusDamage > 0.0f || s.bonusHealth > 0 || s.bonusMana > 0 ||
-                            s.bonusArmor > 0 || s.bonusHaste > 0.0f ||
+            bool anyBonus = s.bonusStrength > 0 || s.bonusAgility > 0 ||
+                            s.bonusIntellect > 0 || s.bonusStamina > 0 ||
+                            s.bonusAttackPower > 0 || s.bonusSpellPower > 0 ||
+                            s.bonusCritRating > 0 || s.bonusDodgeRating > 0 ||
+                            s.bonusParryRating > 0 || s.bonusHasteRating > 0 ||
+                            s.bonusHitRating > 0 || s.bonusArmorPenRating > 0 ||
+                            s.bonusExpertiseRating > 0 || s.bonusArmor > 0 ||
+                            s.bonusWeaponDmg > 0.0f ||
                             s.bonusResHoly > 0 || s.bonusResFire > 0 || s.bonusResNature > 0 ||
                             s.bonusResFrost > 0 || s.bonusResShadow > 0 || s.bonusResArcane > 0;
             if (anyBonus)
             {
                 handler->PSendSysMessage("--- Bonus Stats ---");
-                if (s.bonusDamage > 0.0f)
-                    handler->PSendSysMessage("  Damage: +{:.1f}", s.bonusDamage);
-                if (s.bonusHealth > 0)
-                    handler->PSendSysMessage("  Health: +{}", s.bonusHealth);
-                if (s.bonusMana > 0)
-                    handler->PSendSysMessage("  Mana: +{}", s.bonusMana);
+                if (s.bonusStrength > 0)
+                    handler->PSendSysMessage("  STR: +{} (+{:.0f} melee AP)", s.bonusStrength, GetBonusMeleeAP(s));
+                if (s.bonusAgility > 0)
+                    handler->PSendSysMessage("  AGI: +{} (+{:.2f}% crit)", s.bonusAgility, static_cast<float>(s.bonusAgility) / 62.5f);
+                if (s.bonusIntellect > 0)
+                    handler->PSendSysMessage("  INT: +{} (+{} mana, +{} SP)", s.bonusIntellect, GetBonusMana(s), s.bonusIntellect);
+                if (s.bonusStamina > 0)
+                    handler->PSendSysMessage("  STA: +{} (+{} HP)", s.bonusStamina, GetBonusHealth(s));
+                if (s.bonusAttackPower > 0)
+                    handler->PSendSysMessage("  Attack Power: +{}", s.bonusAttackPower);
+                if (s.bonusSpellPower > 0)
+                    handler->PSendSysMessage("  Spell Power: +{}", s.bonusSpellPower);
+                if (s.bonusCritRating > 0)
+                    handler->PSendSysMessage("  Crit Rating: +{} (+{:.2f}%)", s.bonusCritRating, static_cast<float>(s.bonusCritRating) / CRIT_RATING_PER_PCT);
+                if (s.bonusDodgeRating > 0)
+                    handler->PSendSysMessage("  Dodge Rating: +{} (+{:.2f}%)", s.bonusDodgeRating, GetBonusDodgePct(s));
+                if (s.bonusParryRating > 0)
+                    handler->PSendSysMessage("  Parry Rating: +{} (+{:.2f}%)", s.bonusParryRating, GetBonusParryPct(s));
+                if (s.bonusHasteRating > 0)
+                    handler->PSendSysMessage("  Haste Rating: +{} (+{:.2f}%)", s.bonusHasteRating, GetBonusHastePct(s));
+                if (s.bonusHitRating > 0)
+                    handler->PSendSysMessage("  Hit Rating: +{}", s.bonusHitRating);
+                if (s.bonusArmorPenRating > 0)
+                    handler->PSendSysMessage("  Armor Pen: +{}", s.bonusArmorPenRating);
+                if (s.bonusExpertiseRating > 0)
+                    handler->PSendSysMessage("  Expertise: +{}", s.bonusExpertiseRating);
                 if (s.bonusArmor > 0)
                     handler->PSendSysMessage("  Armor: +{}", s.bonusArmor);
-                if (s.bonusHaste > 0.0f)
-                    handler->PSendSysMessage("  Haste: +{:.2f}%", s.bonusHaste);
+                if (s.bonusWeaponDmg > 0.0f)
+                    handler->PSendSysMessage("  Weapon Dmg: +{:.1f}", s.bonusWeaponDmg);
                 if (s.bonusResHoly > 0)
                     handler->PSendSysMessage("  Holy Res: +{}", s.bonusResHoly);
                 if (s.bonusResFire > 0)
@@ -2719,12 +2999,11 @@ public:
 
         std::string itemName = proto->Name1;
 
-        // Snapshot old bonuses to compute delta for live guardian
-        float oldDmg = s.bonusDamage;
-        uint32 oldHP = s.bonusHealth;
-        uint32 oldMana = s.bonusMana;
+        // Snapshot old derived values for live delta
+        uint32 oldHP = GetBonusHealth(s);
+        uint32 oldMana = GetBonusMana(s);
         uint32 oldArmor = s.bonusArmor;
-        float oldHaste = s.bonusHaste;
+        float oldHaste = GetBonusHastePct(s);
         int32 oldResH = s.bonusResHoly, oldResF = s.bonusResFire, oldResN = s.bonusResNature;
         int32 oldResFr = s.bonusResFrost, oldResS = s.bonusResShadow, oldResA = s.bonusResArcane;
 
@@ -2734,35 +3013,31 @@ public:
         player->DestroyItemCount(itemEntry, 1, true);
 
         // Apply delta to live guardian if summoned
+        // Damage/crit/dodge/parry deltas are automatic via UnitScript hooks
         if (s.IsActive())
         {
             Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
             if (guardian && guardian->IsAlive())
             {
-                float dmgDelta = s.bonusDamage - oldDmg;
-                if (dmgDelta > 0.0f)
+                uint32 newHP = GetBonusHealth(s);
+                if (newHP > oldHP)
                 {
-                    guardian->SetStatFloatValue(UNIT_FIELD_MINDAMAGE,
-                        guardian->GetFloatValue(UNIT_FIELD_MINDAMAGE) + dmgDelta);
-                    guardian->SetStatFloatValue(UNIT_FIELD_MAXDAMAGE,
-                        guardian->GetFloatValue(UNIT_FIELD_MAXDAMAGE) + dmgDelta);
-                }
-                uint32 hpDelta = s.bonusHealth - oldHP;
-                if (hpDelta > 0)
-                {
+                    uint32 hpDelta = newHP - oldHP;
                     guardian->SetMaxHealth(guardian->GetMaxHealth() + hpDelta);
                     guardian->SetHealth(guardian->GetHealth() + hpDelta);
                 }
-                uint32 manaDelta = s.bonusMana - oldMana;
-                if (manaDelta > 0 && guardian->getPowerType() == POWER_MANA)
+                uint32 newMana = GetBonusMana(s);
+                if (newMana > oldMana && guardian->getPowerType() == POWER_MANA)
                 {
+                    uint32 manaDelta = newMana - oldMana;
                     guardian->SetMaxPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA) + manaDelta);
                     guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + static_cast<int32>(manaDelta));
                 }
                 uint32 armorDelta = s.bonusArmor - oldArmor;
                 if (armorDelta > 0)
                     guardian->SetArmor(guardian->GetArmor() + armorDelta);
-                float hasteDelta = s.bonusHaste - oldHaste;
+                float newHaste = GetBonusHastePct(s);
+                float hasteDelta = newHaste - oldHaste;
                 if (hasteDelta > 0.0f)
                 {
                     guardian->ApplyAttackTimePercentMod(BASE_ATTACK, hasteDelta, true);
@@ -2839,16 +3114,23 @@ public:
         memset(&preview, 0, sizeof(preview));
         ExtractItemBonuses(proto, preview);
 
-        // Send FEEDPREVIEW addon message:
-        // FEEDPREVIEW:<slot>:<itemEntry>:<dmg>:<hp>:<mana>:<armor>:<haste>:<resH>:<resF>:<resN>:<resFr>:<resS>:<resA>
+        // Send FEEDPREVIEW addon message with new stat format
         std::ostringstream ss;
         ss << ADDON_PREFIX << "\tFEEDPREVIEW:" << (uint32)guardianSlot
            << ":" << itemEntry
-           << ":" << std::fixed << std::setprecision(1) << preview.bonusDamage
-           << ":" << preview.bonusHealth
-           << ":" << preview.bonusMana
+           << ":" << preview.bonusStrength
+           << ":" << preview.bonusAgility
+           << ":" << preview.bonusIntellect
+           << ":" << preview.bonusStamina
+           << ":" << preview.bonusAttackPower
+           << ":" << preview.bonusSpellPower
+           << ":" << preview.bonusCritRating
+           << ":" << preview.bonusDodgeRating
+           << ":" << preview.bonusParryRating
+           << ":" << preview.bonusHasteRating
+           << ":" << preview.bonusHitRating
            << ":" << preview.bonusArmor
-           << ":" << std::fixed << std::setprecision(2) << preview.bonusHaste
+           << ":" << std::fixed << std::setprecision(1) << preview.bonusWeaponDmg
            << ":" << preview.bonusResHoly
            << ":" << preview.bonusResFire
            << ":" << preview.bonusResNature
@@ -3626,6 +3908,115 @@ public:
 };
 
 // ============================================================================
+// UnitScript — Damage scaling and melee outcome hooks for guardian bonuses
+// ============================================================================
+
+// Helper: find the GuardianSlotData for a unit if it's a captured guardian
+static GuardianSlotData* FindGuardianSlot(Unit const* unit)
+{
+    if (!unit || !unit->IsCreature())
+        return nullptr;
+
+    Creature const* creature = unit->ToCreature();
+    CapturedGuardianAI const* ai = dynamic_cast<CapturedGuardianAI const*>(creature->AI());
+    if (!ai)
+        return nullptr;
+
+    ObjectGuid ownerGuid = creature->GetOwnerGUID();
+    if (ownerGuid.IsEmpty())
+        return nullptr;
+
+    Player* owner = ObjectAccessor::GetPlayer(*creature, ownerGuid);
+    if (!owner)
+        return nullptr;
+
+    CapturedGuardianData* data = owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    uint8 slotIdx = ai->GetSlotIndex();
+    if (slotIdx >= MAX_GUARDIAN_SLOTS)
+        return nullptr;
+
+    return &data->slots[slotIdx];
+}
+
+class CaptureGuardianUnitScript : public UnitScript
+{
+public:
+    CaptureGuardianUnitScript() : UnitScript("CaptureGuardianUnitScript", true, {
+        UNITHOOK_MODIFY_MELEE_DAMAGE,
+        UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN,
+        UNITHOOK_MODIFY_PERIODIC_DAMAGE_AURAS_TICK,
+        UNITHOOK_ON_BEFORE_ROLL_MELEE_OUTCOME_AGAINST
+    }) {}
+
+    // Melee damage: attacker is guardian → add bonus
+    void ModifyMeleeDamage(Unit* /*target*/, Unit* attacker, uint32& damage) override
+    {
+        GuardianSlotData* slot = FindGuardianSlot(attacker);
+        if (!slot)
+            return;
+
+        CapturedGuardianAI const* ai = dynamic_cast<CapturedGuardianAI const*>(attacker->ToCreature()->AI());
+        float ap = (ai && ai->IsRangedDps()) ? GetBonusRangedAP(*slot) : GetBonusMeleeAP(*slot);
+        float flatBonus = ap / 14.0f + slot->bonusWeaponDmg;
+        if (flatBonus > 0.0f)
+            damage += static_cast<uint32>(flatBonus);
+    }
+
+    // Spell damage: if attacker is guardian → add spell power bonus
+    void ModifySpellDamageTaken(Unit* /*target*/, Unit* attacker, int32& damage, SpellInfo const* /*spellInfo*/) override
+    {
+        GuardianSlotData* slot = FindGuardianSlot(attacker);
+        if (!slot)
+            return;
+
+        float sp = GetBonusSpellPower(*slot);
+        float flatBonus = sp * 0.3f; // average spell coefficient
+        if (flatBonus > 0.0f)
+            damage += static_cast<int32>(flatBonus);
+    }
+
+    // Periodic (DoT) damage: if attacker is guardian → add spell power bonus
+    void ModifyPeriodicDamageAurasTick(Unit* /*target*/, Unit* attacker, uint32& damage, SpellInfo const* /*spellInfo*/) override
+    {
+        GuardianSlotData* slot = FindGuardianSlot(attacker);
+        if (!slot)
+            return;
+
+        float sp = GetBonusSpellPower(*slot);
+        float flatBonus = sp * 0.1f; // lower coefficient for DoTs
+        if (flatBonus > 0.0f)
+            damage += static_cast<uint32>(flatBonus);
+    }
+
+    // Melee outcome: adjust crit/dodge/parry chances
+    void OnBeforeRollMeleeOutcomeAgainst(Unit const* attacker, Unit const* victim,
+        WeaponAttackType /*attType*/, int32& /*attackerMaxSkillValueForLevel*/,
+        int32& /*victimMaxSkillValueForLevel*/, int32& /*attackerWeaponSkill*/,
+        int32& /*victimDefenseSkill*/, int32& crit_chance, int32& /*miss_chance*/,
+        int32& dodge_chance, int32& parry_chance, int32& /*block_chance*/) override
+    {
+        // If attacker is a guardian: boost crit chance
+        GuardianSlotData* attackerSlot = FindGuardianSlot(attacker);
+        if (attackerSlot)
+        {
+            float critPct = GetBonusCritPct(*attackerSlot);
+            crit_chance += static_cast<int32>(critPct * 100.0f); // units are 0.01%
+        }
+
+        // If victim is a guardian: boost dodge/parry chance
+        GuardianSlotData* victimSlot = FindGuardianSlot(victim);
+        if (victimSlot)
+        {
+            float dodgePct = GetBonusDodgePct(*victimSlot);
+            dodge_chance += static_cast<int32>(dodgePct * 100.0f);
+
+            float parryPct = GetBonusParryPct(*victimSlot);
+            parry_chance += static_cast<int32>(parryPct * 100.0f);
+        }
+    }
+};
+
+// ============================================================================
 // Registration
 // ============================================================================
 
@@ -3636,4 +4027,5 @@ void AddSC_mod_creature_capture()
     new CreatureCaptureWorldScript();
     new TesseractItemScript();
     new CaptureGuardianGossipScript();
+    new CaptureGuardianUnitScript();
 }
