@@ -494,6 +494,7 @@ public:
         _slotIndex(slotIndex),
         _rangedDps(rangedDps),
         _preferredRange(0.0f),
+        _recoveryRange(0.0f),
         _updateTimer(1000),
         _combatCheckTimer(500),
         _regenTimer(2000)
@@ -908,7 +909,13 @@ public:
             // Ranged DPS and healers with ranged spells keep their distance
             if (_preferredRange > 5.0f &&
                 ((_archetype == ARCHETYPE_DPS && _rangedDps) || _archetype == ARCHETYPE_HEALER))
+            {
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage(
+                        "|cffff8800[RangedAI]|r AttackStart -> "
+                        "MoveChase preferred={:.1f}", _preferredRange);
                 me->GetMotionMaster()->MoveChase(target, _preferredRange);
+            }
             else
                 me->GetMotionMaster()->MoveChase(target);
         }
@@ -1021,10 +1028,12 @@ private:
     void RecalcPreferredRange()
     {
         _preferredRange = 0.0f;
+        _recoveryRange  = 0.0f;
         if (!_rangedDps && _archetype != ARCHETYPE_HEALER)
             return;
 
-        float minRange = 999.0f;
+        float smallestMax = 999.0f;
+        float biggestMin  = 0.0f;
         for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
         {
             if (!_spellSlots[i])
@@ -1037,13 +1046,22 @@ private:
             if (IsRangedSpell(spellInfo))
             {
                 float maxRange = spellInfo->GetMaxRange(false);
-                if (maxRange < minRange)
-                    minRange = maxRange;
+                if (maxRange < smallestMax)
+                    smallestMax = maxRange;
+
+                float minRange = spellInfo->GetMinRange(false);
+                if (minRange > biggestMin)
+                    biggestMin = minRange;
             }
         }
 
-        if (minRange < 999.0f)
-            _preferredRange = minRange * 0.8f; // stay slightly inside max range
+        if (smallestMax < 999.0f)
+            _preferredRange = smallestMax * 0.8f; // stay slightly inside max range
+
+        // Recovery range: just past the biggest minimum range so all
+        // ranged spells can fire.  Used for deadzone retreat distance
+        // and for re-engaging at range after melee.
+        _recoveryRange = biggestMin + 3.0f;
     }
 
     // Find an enemy attacking any fellow guardian
@@ -1134,6 +1152,80 @@ private:
 
     void UpdateRangedDpsAI()
     {
+        // Target too close — decide whether to retreat or close to melee.
+        Unit* victim = me->GetVictim();
+        bool tooClose = victim && _recoveryRange > 5.0f &&
+            me->IsWithinDistInMap(victim, _recoveryRange);
+
+        // Clear stale retreat tracking when we're at safe distance
+        if (!tooClose)
+            _retreatPending = false;
+
+        if (tooClose &&
+            _repositionTimer <= 0 &&
+            !me->HasUnitState(UNIT_STATE_CASTING))
+        {
+            bool enemyTargetingUs = victim->GetVictim() == me;
+            float curDist = me->GetDistance(victim);
+
+            // Check if a previous retreat failed — did the guardian
+            // actually move from its pre-retreat position?
+            if (_retreatPending)
+            {
+                _retreatPending = false;
+                float moved = me->GetDistance2d(
+                    _preRetreatPos.GetPositionX(),
+                    _preRetreatPos.GetPositionY());
+                if (moved < 1.0f)
+                {
+                    // Retreat didn't work — give up and close to melee
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage(
+                            "|cffff8800[RangedAI]|r retreat failed "
+                            "(moved {:.1f}), close to melee", moved);
+                    _repositionTimer = 3000;
+                    me->GetMotionMaster()->MoveChase(victim, 0.0f);
+                    return;
+                }
+            }
+
+            if (enemyTargetingUs)
+            {
+                // Enemy is on us — close to melee, no point kiting.
+                if (!me->IsWithinMeleeRange(victim))
+                {
+                    _repositionTimer = 1000;
+                    if (_owner)
+                        ChatHandler(_owner->GetSession()).PSendSysMessage(
+                            "|cffff8800[RangedAI]|r close to melee (dist={:.1f})",
+                            curDist);
+                    me->GetMotionMaster()->MoveChase(victim, 0.0f);
+                }
+            }
+            else
+            {
+                // Someone else has aggro — back away to recovery range.
+                _repositionTimer = 2000;
+                float retreatDist = _recoveryRange - curDist;
+                if (retreatDist < 1.0f)
+                    retreatDist = 1.0f;
+
+                float awayAngle = victim->GetAngle(me) - me->GetOrientation();
+                Position pos = me->GetFirstCollisionPosition(
+                    retreatDist, awayAngle);
+
+                if (_owner)
+                    ChatHandler(_owner->GetSession()).PSendSysMessage(
+                        "|cffff8800[RangedAI]|r retreat {:.1f} from dist {:.1f}",
+                        retreatDist, curDist);
+
+                _preRetreatPos = me->GetPosition();
+                _retreatPending = true;
+                me->GetMotionMaster()->MovePoint(0, pos.GetPositionX(),
+                    pos.GetPositionY(), pos.GetPositionZ());
+            }
+        }
+
         // Priority 1: Ranged offensive spells
         if (DoCastRangedOffensiveSpells())
             return;
@@ -1152,60 +1244,8 @@ private:
         // Fallback: melee if enemy is close
         DoMeleeAttackIfReady();
         DoCastOffensiveSpells();
-
-        // Dead zone: target is outside melee range but too close for
-        // comfortable ranged combat.  Back away to preferred range so
-        // the guardian can shoot properly instead of standing idle.
-        Unit* victim = me->GetVictim();
-        if (victim && _preferredRange > 5.0f &&
-            _repositionTimer <= 0 &&
-            !me->IsWithinMeleeRange(victim) &&
-            me->IsWithinDistInMap(victim, 6.5f) &&
-            !me->HasUnitState(UNIT_STATE_CASTING))
-        {
-            _repositionTimer = 1000;
-            // Move away from victim; GetFirstCollisionPosition
-            // traces a ray and stops at terrain/walls.
-            float awayAngle = victim->GetAngle(me) - me->GetOrientation();
-            Position pos = me->GetFirstCollisionPosition(5.0f, awayAngle);
-
-            float movedDist = me->GetDistance(pos.GetPositionX(),
-                pos.GetPositionY(), pos.GetPositionZ());
-
-            // If blocked by terrain, try 90 degrees to the right
-            // to slide along the wall.
-            if (movedDist < 2.0f)
-            {
-                pos = me->GetFirstCollisionPosition(
-                    5.0f, awayAngle + M_PI * 1.5f);
-                movedDist = me->GetDistance(pos.GetPositionX(),
-                    pos.GetPositionY(), pos.GetPositionZ());
-            }
-
-            if (movedDist >= 2.0f)
-            {
-                // Enough room to back away — reposition
-                me->GetMotionMaster()->MovePoint(0, pos.GetPositionX(),
-                    pos.GetPositionY(), pos.GetPositionZ());
-            }
-            else
-            {
-                // No room to back away — close to melee instead
-                me->GetMotionMaster()->MoveChase(victim, 0.0f);
-            }
-        }
     }
 
-    void MovementInform(uint32 type, uint32 /*id*/) override
-    {
-        // After backing away, resume chasing at preferred range
-        if (type == POINT_MOTION_TYPE && me->GetVictim() &&
-            _preferredRange > 5.0f &&
-            ((_archetype == ARCHETYPE_DPS && _rangedDps) || _archetype == ARCHETYPE_HEALER))
-        {
-            me->GetMotionMaster()->MoveChase(me->GetVictim(), _preferredRange);
-        }
-    }
 
     void UpdateTankAI(uint32 /*diff*/)
     {
@@ -1694,6 +1734,7 @@ private:
     uint8 _slotIndex;
     bool  _rangedDps;
     float _preferredRange;
+    float _recoveryRange;   // biggest minRange among ranged spells + 3yd
     uint32 _spellSlots[MAX_GUARDIAN_SPELLS];
     int32 _updateTimer;
     int32 _combatCheckTimer;
@@ -1703,6 +1744,8 @@ private:
     int32 _tauntTimer = 0;
     int32 _healthPowerSyncTimer = 1000;
     int32 _repositionTimer = 0;
+    Position _preRetreatPos;        // guardian position before last retreat
+    bool  _retreatPending  = false;
     bool  _hasTauntSpell;
     std::vector<ObjectGuid> _summonedGuids;
 };
