@@ -607,6 +607,8 @@ public:
             _helpCryTimer -= diff;
         if (_tauntTimer > 0)
             _tauntTimer -= diff;
+        if (_repositionTimer > 0)
+            _repositionTimer -= diff;
 
         // Update owner reference
         _updateTimer -= diff;
@@ -1150,6 +1152,59 @@ private:
         // Fallback: melee if enemy is close
         DoMeleeAttackIfReady();
         DoCastOffensiveSpells();
+
+        // Dead zone: target is outside melee range but too close for
+        // comfortable ranged combat.  Back away to preferred range so
+        // the guardian can shoot properly instead of standing idle.
+        Unit* victim = me->GetVictim();
+        if (victim && _preferredRange > 5.0f &&
+            _repositionTimer <= 0 &&
+            !me->IsWithinMeleeRange(victim) &&
+            me->IsWithinDistInMap(victim, 6.5f) &&
+            !me->HasUnitState(UNIT_STATE_CASTING))
+        {
+            _repositionTimer = 1000;
+            // Move away from victim; GetFirstCollisionPosition
+            // traces a ray and stops at terrain/walls.
+            float awayAngle = victim->GetAngle(me) - me->GetOrientation();
+            Position pos = me->GetFirstCollisionPosition(5.0f, awayAngle);
+
+            float movedDist = me->GetDistance(pos.GetPositionX(),
+                pos.GetPositionY(), pos.GetPositionZ());
+
+            // If blocked by terrain, try 90 degrees to the right
+            // to slide along the wall.
+            if (movedDist < 2.0f)
+            {
+                pos = me->GetFirstCollisionPosition(
+                    5.0f, awayAngle + M_PI * 1.5f);
+                movedDist = me->GetDistance(pos.GetPositionX(),
+                    pos.GetPositionY(), pos.GetPositionZ());
+            }
+
+            if (movedDist >= 2.0f)
+            {
+                // Enough room to back away — reposition
+                me->GetMotionMaster()->MovePoint(0, pos.GetPositionX(),
+                    pos.GetPositionY(), pos.GetPositionZ());
+            }
+            else
+            {
+                // No room to back away — close to melee instead
+                me->GetMotionMaster()->MoveChase(victim, 0.0f);
+            }
+        }
+    }
+
+    void MovementInform(uint32 type, uint32 /*id*/) override
+    {
+        // After backing away, resume chasing at preferred range
+        if (type == POINT_MOTION_TYPE && me->GetVictim() &&
+            _preferredRange > 5.0f &&
+            ((_archetype == ARCHETYPE_DPS && _rangedDps) || _archetype == ARCHETYPE_HEALER))
+        {
+            me->GetMotionMaster()->MoveChase(me->GetVictim(), _preferredRange);
+        }
     }
 
     void UpdateTankAI(uint32 /*diff*/)
@@ -1315,6 +1370,11 @@ private:
             if (!me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
                 continue;
 
+            // Skip if target is inside spell's minimum range
+            float minRange = spellInfo->GetMinRange(false);
+            if (minRange > 0.0f && me->IsWithinDistInMap(target, minRange))
+                continue;
+
             bool isPeriodic = spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
                               spellInfo->HasAura(SPELL_AURA_PERIODIC_LEECH) ||
                               spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT);
@@ -1362,6 +1422,11 @@ private:
 
             if (spellInfo->GetMaxRange(false) > 0 &&
                 !me->IsWithinDistInMap(target, spellInfo->GetMaxRange(false)))
+                continue;
+
+            // Skip if target is inside spell's minimum range
+            float minRange = spellInfo->GetMinRange(false);
+            if (minRange > 0.0f && me->IsWithinDistInMap(target, minRange))
                 continue;
 
             bool isPeriodic = spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
@@ -1637,6 +1702,7 @@ private:
     int32 _helpCryTimer = 0;
     int32 _tauntTimer = 0;
     int32 _healthPowerSyncTimer = 1000;
+    int32 _repositionTimer = 0;
     bool  _hasTauntSpell;
     std::vector<ObjectGuid> _summonedGuids;
 };
@@ -2216,7 +2282,7 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     guardian->SetOwnerGUID(player->GetGUID());
     guardian->SetCreatorGUID(player->GetGUID());
     guardian->SetFaction(player->GetFaction());
-    guardian->SetLevel(level);
+    guardian->SetLevel(level, false);
 
     guardian->RemoveUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_ATTACKABLE_1);
     guardian->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PLAYER_CONTROLLED);
