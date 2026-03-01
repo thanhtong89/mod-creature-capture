@@ -27,6 +27,7 @@
 #include "TemporarySummon.h"
 #include "Unit.h"
 #include "WorldPacket.h"
+#include "DBCStores.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -2335,7 +2336,7 @@ static void ExtractEquipSpellBonuses(ItemTemplate const* item, GuardianSlotData&
 
         for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
         {
-            int32 bp = spellInfo->Effects[eff].BasePoints / 2;
+            int32 bp = (spellInfo->Effects[eff].BasePoints + 1) / 2;
             if (bp <= 0)
                 continue;
 
@@ -2517,6 +2518,156 @@ static void ExtractItemBonuses(ItemTemplate const* item, GuardianSlotData& s)
 
     // Extract on-equip spell bonuses (e.g. trinkets, set bonuses)
     ExtractEquipSpellBonuses(item, s);
+}
+
+// Extract stats from a single enchantment entry (used for random suffixes/properties)
+static void ApplyEnchantStatToSlot(uint32 statType, int32 amount,
+                                   GuardianSlotData& s)
+{
+    int32 half = amount / 2;
+    if (half <= 0)
+        return;
+
+    switch (statType)
+    {
+        case ITEM_MOD_STRENGTH:       s.bonusStrength += half;    break;
+        case ITEM_MOD_AGILITY:        s.bonusAgility += half;     break;
+        case ITEM_MOD_INTELLECT:      s.bonusIntellect += half;   break;
+        case ITEM_MOD_STAMINA:        s.bonusStamina += half;     break;
+        case ITEM_MOD_HEALTH:         s.bonusStamina += half / 10; break;
+        case ITEM_MOD_MANA:           s.bonusIntellect += half / 15; break;
+        case ITEM_MOD_ATTACK_POWER:
+        case ITEM_MOD_RANGED_ATTACK_POWER:
+            s.bonusAttackPower += half; break;
+        case ITEM_MOD_SPELL_POWER:
+        case ITEM_MOD_SPELL_HEALING_DONE:
+        case ITEM_MOD_SPELL_DAMAGE_DONE:
+            s.bonusSpellPower += half; break;
+        case ITEM_MOD_CRIT_RATING:
+        case ITEM_MOD_CRIT_MELEE_RATING:
+        case ITEM_MOD_CRIT_RANGED_RATING:
+        case ITEM_MOD_CRIT_SPELL_RATING:
+            s.bonusCritRating += half; break;
+        case ITEM_MOD_DODGE_RATING:   s.bonusDodgeRating += half;   break;
+        case ITEM_MOD_PARRY_RATING:   s.bonusParryRating += half;   break;
+        case ITEM_MOD_HASTE_RATING:
+        case ITEM_MOD_HASTE_MELEE_RATING:
+        case ITEM_MOD_HASTE_RANGED_RATING:
+        case ITEM_MOD_HASTE_SPELL_RATING:
+            s.bonusHasteRating += half; break;
+        case ITEM_MOD_HIT_RATING:
+        case ITEM_MOD_HIT_MELEE_RATING:
+        case ITEM_MOD_HIT_RANGED_RATING:
+        case ITEM_MOD_HIT_SPELL_RATING:
+            s.bonusHitRating += half; break;
+        case ITEM_MOD_ARMOR_PENETRATION_RATING:
+            s.bonusArmorPenRating += half; break;
+        case ITEM_MOD_EXPERTISE_RATING:
+            s.bonusExpertiseRating += half; break;
+        case ITEM_MOD_BLOCK_RATING:   s.bonusBlockRating += half;   break;
+        case ITEM_MOD_BLOCK_VALUE:    s.bonusBlockValue += half;    break;
+        default: break;
+    }
+}
+
+// Extract bonuses from random suffixes/properties on an actual item instance
+static void ExtractRandomEnchantBonuses(Item const* item,
+                                        GuardianSlotData& s)
+{
+    if (!item)
+        return;
+
+    int32 randomPropId = item->GetItemRandomPropertyId();
+    if (randomPropId == 0)
+        return;
+
+    for (uint32 slot = PROP_ENCHANTMENT_SLOT_0;
+         slot <= PROP_ENCHANTMENT_SLOT_4; ++slot)
+    {
+        uint32 enchantId = item->GetEnchantmentId(
+            static_cast<EnchantmentSlot>(slot));
+        if (!enchantId)
+            continue;
+
+        SpellItemEnchantmentEntry const* enchant =
+            sSpellItemEnchantmentStore.LookupEntry(enchantId);
+        if (!enchant)
+            continue;
+
+        for (uint8 e = 0; e < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++e)
+        {
+            uint32 type = enchant->type[e];
+            uint32 amount = enchant->amount[e];
+
+            // For random suffixes, the amount stored in the enchantment
+            // is zero — compute it from AllocationPct * SuffixFactor
+            if (randomPropId < 0 && amount == 0)
+            {
+                ItemRandomSuffixEntry const* suffixEntry =
+                    sItemRandomSuffixStore.LookupEntry(
+                        static_cast<uint32>(-randomPropId));
+                if (suffixEntry)
+                {
+                    for (int k = 0; k < MAX_ITEM_ENCHANTMENT_EFFECTS;
+                         ++k)
+                    {
+                        if (suffixEntry->Enchantment[k] == enchantId)
+                        {
+                            amount = (suffixEntry->AllocationPct[k]
+                                * item->GetItemSuffixFactor()) / 10000;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (amount == 0)
+                continue;
+
+            switch (type)
+            {
+                case ITEM_ENCHANTMENT_TYPE_STAT:
+                    // spellid field holds the ITEM_MOD_* stat type
+                    ApplyEnchantStatToSlot(
+                        enchant->spellid[e], amount, s);
+                    break;
+                case ITEM_ENCHANTMENT_TYPE_RESISTANCE:
+                    // spellid field holds SpellSchools index
+                    switch (enchant->spellid[e])
+                    {
+                        case SPELL_SCHOOL_HOLY:
+                            s.bonusResHoly += amount / 2; break;
+                        case SPELL_SCHOOL_FIRE:
+                            s.bonusResFire += amount / 2; break;
+                        case SPELL_SCHOOL_NATURE:
+                            s.bonusResNature += amount / 2; break;
+                        case SPELL_SCHOOL_FROST:
+                            s.bonusResFrost += amount / 2; break;
+                        case SPELL_SCHOOL_SHADOW:
+                            s.bonusResShadow += amount / 2; break;
+                        case SPELL_SCHOOL_ARCANE:
+                            s.bonusResArcane += amount / 2; break;
+                        default: break;
+                    }
+                    break;
+                case ITEM_ENCHANTMENT_TYPE_DAMAGE:
+                    s.bonusWeaponDmg += amount * 0.5f;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+
+// Overload: extract bonuses from an actual item instance
+// (includes base template stats + random suffix/property stats)
+static void ExtractItemBonuses(Item const* item, GuardianSlotData& s)
+{
+    if (!item)
+        return;
+    ExtractItemBonuses(item->GetTemplate(), s);
+    ExtractRandomEnchantBonuses(item, s);
 }
 
 // ============================================================================
@@ -3049,7 +3200,7 @@ public:
         int32 oldResH = s.bonusResHoly, oldResF = s.bonusResFire, oldResN = s.bonusResNature;
         int32 oldResFr = s.bonusResFrost, oldResS = s.bonusResShadow, oldResA = s.bonusResArcane;
 
-        ExtractItemBonuses(proto, s);
+        ExtractItemBonuses(item, s);
 
         // Destroy one copy of the item
         player->DestroyItemCount(itemEntry, 1, true);
@@ -3136,7 +3287,8 @@ public:
             return true;
         }
 
-        if (!player->GetItemByEntry(itemEntry))
+        Item* item = player->GetItemByEntry(itemEntry);
+        if (!item)
         {
             handler->PSendSysMessage("|cffff0000[Guardian]|r You don't have that item.");
             return true;
@@ -3154,7 +3306,7 @@ public:
         // Compute preview by extracting into a temporary slot copy
         GuardianSlotData preview;
         memset(&preview, 0, sizeof(preview));
-        ExtractItemBonuses(proto, preview);
+        ExtractItemBonuses(item, preview);
 
         // Send FEEDPREVIEW addon message with new stat format
         std::ostringstream ss;
