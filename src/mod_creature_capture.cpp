@@ -910,10 +910,6 @@ public:
             if (_preferredRange > 5.0f &&
                 ((_archetype == ARCHETYPE_DPS && _rangedDps) || _archetype == ARCHETYPE_HEALER))
             {
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage(
-                        "|cffff8800[RangedAI]|r AttackStart -> "
-                        "MoveChase preferred={:.1f}", _preferredRange);
                 me->GetMotionMaster()->MoveChase(target, _preferredRange);
             }
             else
@@ -1176,13 +1172,9 @@ private:
                 float moved = me->GetDistance2d(
                     _preRetreatPos.GetPositionX(),
                     _preRetreatPos.GetPositionY());
-                if (moved < 1.0f)
+                if (moved < 0.5f)
                 {
                     // Retreat didn't work — give up and close to melee
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage(
-                            "|cffff8800[RangedAI]|r retreat failed "
-                            "(moved {:.1f}), close to melee", moved);
                     _repositionTimer = 3000;
                     me->GetMotionMaster()->MoveChase(victim, 0.0f);
                     return;
@@ -1195,10 +1187,6 @@ private:
                 if (!me->IsWithinMeleeRange(victim))
                 {
                     _repositionTimer = 1000;
-                    if (_owner)
-                        ChatHandler(_owner->GetSession()).PSendSysMessage(
-                            "|cffff8800[RangedAI]|r close to melee (dist={:.1f})",
-                            curDist);
                     me->GetMotionMaster()->MoveChase(victim, 0.0f);
                 }
             }
@@ -1207,17 +1195,12 @@ private:
                 // Someone else has aggro — back away to recovery range.
                 _repositionTimer = 2000;
                 float retreatDist = _recoveryRange - curDist;
-                if (retreatDist < 1.0f)
-                    retreatDist = 1.0f;
+                if (retreatDist < 3.0f)
+                    retreatDist = 3.0f;
 
                 float awayAngle = victim->GetAngle(me) - me->GetOrientation();
                 Position pos = me->GetFirstCollisionPosition(
                     retreatDist, awayAngle);
-
-                if (_owner)
-                    ChatHandler(_owner->GetSession()).PSendSysMessage(
-                        "|cffff8800[RangedAI]|r retreat {:.1f} from dist {:.1f}",
-                        retreatDist, curDist);
 
                 _preRetreatPos = me->GetPosition();
                 _retreatPending = true;
