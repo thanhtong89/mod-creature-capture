@@ -665,6 +665,36 @@ public:
                 return;
             }
 
+            // Mid-combat retargeting
+            _retargetTimer -= diff;
+            if (_retargetTimer <= 0 && _owner)
+            {
+                _retargetTimer = 500;
+
+                if (_archetype == ARCHETYPE_DPS || _archetype == ARCHETYPE_HEALER)
+                {
+                    // DPS/Healer: follow owner's target swaps
+                    Unit* ownerTarget = _owner->GetVictim();
+                    if (ownerTarget && ownerTarget != me->GetVictim() &&
+                        ownerTarget->IsAlive() && me->CanCreatureAttack(ownerTarget))
+                    {
+                        if (_archetype != ARCHETYPE_HEALER || HasEstablishedTank(ownerTarget))
+                            AttackStart(ownerTarget);
+                    }
+                }
+                else if (_archetype == ARCHETYPE_TANK)
+                {
+                    // Tank: switch to peel mobs attacking owner
+                    Unit* ownerAttacker = _owner->getAttackerForHelper();
+                    if (ownerAttacker && ownerAttacker != me->GetVictim() &&
+                        ownerAttacker->IsAlive() && me->CanCreatureAttack(ownerAttacker))
+                    {
+                        me->AddThreat(ownerAttacker, 200.0f);
+                        AttackStart(ownerAttacker);
+                    }
+                }
+            }
+
             switch (_archetype)
             {
                 case ARCHETYPE_TANK:   UpdateTankAI(diff);   break;
@@ -759,30 +789,41 @@ public:
                         if (_owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
                             DoCastHealingSpells();
                     }
-                    else
+                    else if (_archetype == ARCHETYPE_TANK)
                     {
-                        if (_archetype == ARCHETYPE_TANK)
-                        {
-                            if (Unit* attacker = _owner->getAttackerForHelper())
-                            {
-                                if (me->CanCreatureAttack(attacker))
-                                {
-                                    me->AddThreat(attacker, 200.0f);
-                                    AttackStart(attacker);
-                                    return;
-                                }
-                            }
-                        }
-
+                        // Tank: pull mobs off the player first
                         if (Unit* attacker = _owner->getAttackerForHelper())
                         {
                             if (me->CanCreatureAttack(attacker))
                             {
+                                me->AddThreat(attacker, 200.0f);
                                 AttackStart(attacker);
                                 return;
                             }
                         }
 
+                        // Tank: pull mobs off non-tank guardians
+                        if (Unit* allyAttacker = FindNonTankAllyAttacker())
+                        {
+                            me->AddThreat(allyAttacker, 200.0f);
+                            AttackStart(allyAttacker);
+                            return;
+                        }
+
+                        // Tank: defend self from attackers
+                        for (Unit* attacker : me->getAttackers())
+                        {
+                            if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                            {
+                                me->AddThreat(attacker, 100.0f);
+                                AttackStart(attacker);
+                                return;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // DPS: focus on owner's target first (concentrate damage)
                         if (Unit* ownerTarget = _owner->GetVictim())
                         {
                             if (me->CanCreatureAttack(ownerTarget))
@@ -792,28 +833,31 @@ public:
                             }
                         }
 
-                        // Defend fellow guardians being attacked
-                        if (!me->GetVictim())
+                        // DPS: defend owner from attackers
+                        if (Unit* attacker = _owner->getAttackerForHelper())
                         {
-                            Unit* allyAttacker = FindAllyAttacker();
-                            if (allyAttacker)
+                            if (me->CanCreatureAttack(attacker))
                             {
-                                AttackStart(allyAttacker);
+                                AttackStart(attacker);
                                 return;
                             }
                         }
 
-                        // Defend self from attackers
-                        if (!me->GetVictim())
+                        // DPS: defend fellow guardians
+                        if (Unit* allyAttacker = FindAllyAttacker())
                         {
-                            for (Unit* attacker : me->getAttackers())
+                            AttackStart(allyAttacker);
+                            return;
+                        }
+
+                        // DPS: defend self from attackers
+                        for (Unit* attacker : me->getAttackers())
+                        {
+                            if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
                             {
-                                if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
-                                {
-                                    me->AddThreat(attacker, 100.0f);
-                                    AttackStart(attacker);
-                                    return;
-                                }
+                                me->AddThreat(attacker, 100.0f);
+                                AttackStart(attacker);
+                                return;
                             }
                         }
                     }
@@ -1071,6 +1115,34 @@ private:
         {
             GuardianSlotData& s = data->slots[i];
             if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                continue;
+
+            Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+            if (!ally || !ally->IsAlive())
+                continue;
+
+            for (Unit* attacker : ally->getAttackers())
+            {
+                if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                    return attacker;
+            }
+        }
+        return nullptr;
+    }
+
+    // Find an enemy attacking a non-tank fellow guardian (for tank peeling)
+    Unit* FindNonTankAllyAttacker()
+    {
+        if (!_owner)
+            return nullptr;
+
+        CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+        {
+            GuardianSlotData& s = data->slots[i];
+            if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                continue;
+            if (s.archetype == ARCHETYPE_TANK)
                 continue;
 
             Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
@@ -1721,6 +1793,7 @@ private:
     uint32 _spellSlots[MAX_GUARDIAN_SPELLS];
     int32 _updateTimer;
     int32 _combatCheckTimer;
+    int32 _retargetTimer = 500;
     int32 _regenTimer;
     int32 _summonCheckTimer = 1000;
     int32 _helpCryTimer = 0;
