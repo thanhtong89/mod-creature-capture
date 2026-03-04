@@ -681,6 +681,15 @@ public:
                         if (_archetype != ARCHETYPE_HEALER || HasEstablishedTank(ownerTarget))
                             AttackStart(ownerTarget);
                     }
+                    // Healer: also follow fellow guardians' targets
+                    else if (_archetype == ARCHETYPE_HEALER && !me->GetVictim())
+                    {
+                        if (Unit* allyTarget = FindAllyTarget())
+                        {
+                            if (HasEstablishedTank(allyTarget))
+                                AttackStart(allyTarget);
+                        }
+                    }
                 }
                 else if (_archetype == ARCHETYPE_TANK)
                 {
@@ -765,22 +774,17 @@ public:
                 {
                     if (_archetype == ARCHETYPE_HEALER)
                     {
-                        // Healer: only engage owner's attacker or owner's target
-                        // if another guardian is already tanking it
-                        if (Unit* attacker = _owner->getAttackerForHelper())
+                        // Healer: engage any tanked target from owner or allies
+                        Unit* candidates[] = {
+                            _owner->getAttackerForHelper(),
+                            _owner->GetVictim(),
+                            FindAllyTarget()
+                        };
+                        for (Unit* c : candidates)
                         {
-                            if (me->CanCreatureAttack(attacker) && HasEstablishedTank(attacker))
+                            if (c && me->CanCreatureAttack(c) && HasEstablishedTank(c))
                             {
-                                AttackStart(attacker);
-                                return;
-                            }
-                        }
-
-                        if (Unit* ownerTarget = _owner->GetVictim())
-                        {
-                            if (me->CanCreatureAttack(ownerTarget) && HasEstablishedTank(ownerTarget))
-                            {
-                                AttackStart(ownerTarget);
+                                AttackStart(c);
                                 return;
                             }
                         }
@@ -803,7 +807,7 @@ public:
                         }
 
                         // Tank: pull mobs off non-tank guardians
-                        if (Unit* allyAttacker = FindNonTankAllyAttacker())
+                        if (Unit* allyAttacker = FindAllyAttacker(/*excludeTanks=*/true))
                         {
                             me->AddThreat(allyAttacker, 200.0f);
                             AttackStart(allyAttacker);
@@ -823,31 +827,19 @@ public:
                     }
                     else
                     {
-                        // DPS: focus on owner's target first (concentrate damage)
-                        if (Unit* ownerTarget = _owner->GetVictim())
+                        // DPS: owner's target, owner's attacker, ally's attacker
+                        Unit* candidates[] = {
+                            _owner->GetVictim(),
+                            _owner->getAttackerForHelper(),
+                            FindAllyAttacker()
+                        };
+                        for (Unit* c : candidates)
                         {
-                            if (me->CanCreatureAttack(ownerTarget))
+                            if (c && me->CanCreatureAttack(c))
                             {
-                                AttackStart(ownerTarget);
+                                AttackStart(c);
                                 return;
                             }
-                        }
-
-                        // DPS: defend owner from attackers
-                        if (Unit* attacker = _owner->getAttackerForHelper())
-                        {
-                            if (me->CanCreatureAttack(attacker))
-                            {
-                                AttackStart(attacker);
-                                return;
-                            }
-                        }
-
-                        // DPS: defend fellow guardians
-                        if (Unit* allyAttacker = FindAllyAttacker())
-                        {
-                            AttackStart(allyAttacker);
-                            return;
                         }
 
                         // DPS: defend self from attackers
@@ -1104,8 +1096,9 @@ private:
         _recoveryRange = biggestMin + 3.0f;
     }
 
-    // Find an enemy attacking any fellow guardian
-    Unit* FindAllyAttacker()
+    // Find an enemy attacking a fellow guardian.
+    // If excludeTanks is true, skips guardians with tank archetype (for tank peeling).
+    Unit* FindAllyAttacker(bool excludeTanks = false)
     {
         if (!_owner)
             return nullptr;
@@ -1115,6 +1108,8 @@ private:
         {
             GuardianSlotData& s = data->slots[i];
             if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                continue;
+            if (excludeTanks && s.archetype == ARCHETYPE_TANK)
                 continue;
 
             Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
@@ -1130,8 +1125,8 @@ private:
         return nullptr;
     }
 
-    // Find an enemy attacking a non-tank fellow guardian (for tank peeling)
-    Unit* FindNonTankAllyAttacker()
+    // Find a target that a fellow guardian is actively fighting
+    Unit* FindAllyTarget()
     {
         if (!_owner)
             return nullptr;
@@ -1142,18 +1137,14 @@ private:
             GuardianSlotData& s = data->slots[i];
             if (!s.IsActive() || s.guardianGuid == me->GetGUID())
                 continue;
-            if (s.archetype == ARCHETYPE_TANK)
-                continue;
 
             Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
-            if (!ally || !ally->IsAlive())
+            if (!ally || !ally->IsAlive() || !ally->IsInCombat())
                 continue;
 
-            for (Unit* attacker : ally->getAttackers())
-            {
-                if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
-                    return attacker;
-            }
+            Unit* allyTarget = ally->GetVictim();
+            if (allyTarget && allyTarget->IsAlive() && me->CanCreatureAttack(allyTarget))
+                return allyTarget;
         }
         return nullptr;
     }
@@ -1543,17 +1534,11 @@ private:
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
 
-        // Build prioritized list of heal targets
+        // Build prioritized heal target: tank guardian > self > owner > non-tank guardians
         Unit* healTarget = nullptr;
+        Unit* nonTankTarget = nullptr;
 
-        // Owner at 50% or below is top priority
-        if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
-            healTarget = _owner;
-        // Self at 50%
-        else if (me->GetHealthPct() < 50.0f)
-            healTarget = me;
-        // Check other guardians belonging to owner
-        else if (_owner)
+        if (_owner)
         {
             CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
             for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
@@ -1563,13 +1548,28 @@ private:
                     continue;
 
                 Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
-                if (ally && ally->IsAlive() && ally->GetHealthPct() < 50.0f)
+                if (!ally || !ally->IsAlive() || ally->GetHealthPct() >= 50.0f)
+                    continue;
+
+                if (s.archetype == ARCHETYPE_TANK)
                 {
                     healTarget = ally;
-                    break;
+                    break;  // Tank is top priority, stop searching
                 }
+                else if (!nonTankTarget)
+                    nonTankTarget = ally;
             }
         }
+
+        // Self at 50%
+        if (!healTarget && me->GetHealthPct() < 50.0f)
+            healTarget = me;
+        // Owner at 50%
+        if (!healTarget && _owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
+            healTarget = _owner;
+        // Non-tank guardians
+        if (!healTarget)
+            healTarget = nonTankTarget;
 
         if (!healTarget)
             return false;
