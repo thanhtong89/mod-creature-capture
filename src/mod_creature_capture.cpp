@@ -955,6 +955,11 @@ public:
 
     void EnterEvadeMode(EvadeReason /*why*/) override
     {
+        // Don't evade if we already re-engaged a new target — the engine may trigger
+        // evade cleanup for the previous mob in the same tick we called AttackStart.
+        if (me->GetVictim() && me->GetVictim()->IsAlive())
+            return;
+
         me->AttackStop();
         me->GetMotionMaster()->Clear();
         if (_owner)
@@ -1192,6 +1197,15 @@ private:
 
     void UpdateMeleeDpsAI()
     {
+        // If MoveChase was wiped (e.g. by a stale EnterEvadeMode) while we
+        // still have a living target we can't reach, re-issue it.
+        Unit* victim = me->GetVictim();
+        if (victim && !me->IsWithinMeleeRange(victim) &&
+            me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+        {
+            me->GetMotionMaster()->MoveChase(victim);
+        }
+
         DoMeleeAttackIfReady();
 
         // Priority 1: Buff allies (owner + other guardians + self) — e.g. Fire Shield
@@ -1534,42 +1548,82 @@ private:
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
 
-        // Build prioritized heal target: tank guardian > self > owner > non-tank guardians
         Unit* healTarget = nullptr;
-        Unit* nonTankTarget = nullptr;
 
-        if (_owner)
+        // Phase 1: anyone critically low (< 25%) — pick lowest HP across all allies
         {
-            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            float lowestCritical = 25.0f;
+
+            auto CheckCritical = [&](Unit* u)
             {
-                GuardianSlotData& s = data->slots[i];
-                if (!s.IsActive() || s.guardianGuid == me->GetGUID())
-                    continue;
-
-                Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
-                if (!ally || !ally->IsAlive() || ally->GetHealthPct() >= 50.0f)
-                    continue;
-
-                if (s.archetype == ARCHETYPE_TANK)
+                if (!u || !u->IsAlive())
+                    return;
+                float pct = u->GetHealthPct();
+                if (pct < lowestCritical)
                 {
-                    healTarget = ally;
-                    break;  // Tank is top priority, stop searching
+                    lowestCritical = pct;
+                    healTarget = u;
                 }
-                else if (!nonTankTarget)
-                    nonTankTarget = ally;
+            };
+
+            CheckCritical(me);
+            if (_owner)
+            {
+                CheckCritical(_owner);
+                CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+                for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+                {
+                    GuardianSlotData& s = data->slots[i];
+                    if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                        continue;
+                    CheckCritical(ObjectAccessor::GetCreature(*me, s.guardianGuid));
+                }
             }
         }
 
-        // Self at 50%
-        if (!healTarget && me->GetHealthPct() < 50.0f)
-            healTarget = me;
-        // Owner at 50%
-        if (!healTarget && _owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
-            healTarget = _owner;
-        // Non-tank guardians
+        // Phase 2: standard 50% thresholds — tank guardian > self > owner > non-tank (lowest HP)
         if (!healTarget)
-            healTarget = nonTankTarget;
+        {
+            Unit* tankTarget    = nullptr;
+            Unit* nonTankTarget = nullptr;
+            float nonTankLowest = 100.0f;
+
+            if (_owner)
+            {
+                CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+                for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+                {
+                    GuardianSlotData& s = data->slots[i];
+                    if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                        continue;
+
+                    Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+                    if (!ally || !ally->IsAlive() || ally->GetHealthPct() >= 50.0f)
+                        continue;
+
+                    if (s.archetype == ARCHETYPE_TANK && !tankTarget)
+                        tankTarget = ally;
+                    else if (s.archetype != ARCHETYPE_TANK)
+                    {
+                        float pct = ally->GetHealthPct();
+                        if (pct < nonTankLowest)
+                        {
+                            nonTankLowest = pct;
+                            nonTankTarget = ally;
+                        }
+                    }
+                }
+            }
+
+            if (tankTarget)
+                healTarget = tankTarget;
+            else if (me->GetHealthPct() < 50.0f)
+                healTarget = me;
+            else if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
+                healTarget = _owner;
+            else
+                healTarget = nonTankTarget;
+        }
 
         if (!healTarget)
             return false;
@@ -1594,6 +1648,13 @@ private:
 
             // Don't reapply HoTs that are still ticking on the target
             if (isHoT && healTarget->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            // Skip if target is out of range or line of sight
+            float maxRange = spellInfo->GetMaxRange(true);
+            if (maxRange > 0.0f && !me->IsWithinDist(healTarget, maxRange))
+                continue;
+            if (!me->IsWithinLOSInMap(healTarget))
                 continue;
 
             me->CastSpell(healTarget, spellId, false);
