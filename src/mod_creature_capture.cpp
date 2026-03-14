@@ -659,6 +659,13 @@ public:
                 (_owner && me->GetDistance(_owner) > 40.0f))
             {
                 me->AttackStop();
+                // Try the threat table first — if we already have threat on other
+                // enemies, UpdateVictim() re-engages immediately with no gap.
+                if (UpdateVictim())
+                    return;
+                // No threat table entries; reset the combat check timer so the
+                // owner-target scan fires on the very next tick instead of waiting.
+                _combatCheckTimer = 0;
                 me->GetMotionMaster()->Clear();
                 if (_owner)
                     me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
