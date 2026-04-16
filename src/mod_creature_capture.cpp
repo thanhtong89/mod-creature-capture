@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -2081,19 +2082,64 @@ static void DeserializeSpells(std::string const& str, uint32* spells)
     }
 }
 
-// Populate initial spells from creature template
-static void PopulateDefaultSpells(uint32 creatureEntry, uint32* spells)
+// Populate initial spells from creature template and SmartAI combat scripts.
+// Pass a live Creature* to enable difficulty-aware template selection and
+// spell ID resolution (e.g. heroic variants); pass nullptr to use the base
+// template only (e.g. GM commands where no live creature is available).
+static void PopulateDefaultSpells(uint32 creatureEntry, uint32* spells, Creature* creature = nullptr)
 {
     memset(spells, 0, sizeof(uint32) * MAX_GUARDIAN_SPELLS);
-    CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(creatureEntry);
-    if (!cInfo)
+
+    CreatureTemplate const* baseCt = sObjectMgr->GetCreatureTemplate(creatureEntry);
+    if (!baseCt)
         return;
 
-    uint32 slot = 0;
-    for (uint8 i = 0; i < MAX_CREATURE_SPELLS && slot < MAX_GUARDIAN_SPELLS; ++i)
+    CreatureTemplate const* diffCt = creature ? creature->GetCreatureTemplate() : baseCt;
+
+    // Use the difficulty template if it has spells; otherwise fall back to
+    // the base template (mirrors Scarbound domination spell-pool logic)
+    std::set<uint32> spellSet;
+    CreatureTemplate const* spellCt = diffCt;
+    bool hasTemplateSpells = false;
+    for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
     {
-        if (cInfo->spells[i])
-            spells[slot++] = cInfo->spells[i];
+        if (spellCt->spells[i] != 0)
+            hasTemplateSpells = true;
+    }
+    if (!hasTemplateSpells && baseCt != diffCt)
+        spellCt = baseCt;
+    for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
+    {
+        if (spellCt->spells[i] != 0)
+            spellSet.insert(spellCt->spells[i]);
+    }
+
+    // Also gather combat spells from SmartAI scripts (base entry only)
+    // action_type 11 = SMART_ACTION_CAST, 85 = SMART_ACTION_SELF_CAST
+    QueryResult result = WorldDatabase.Query(
+        "SELECT DISTINCT action_param1 FROM smart_scripts "
+        "WHERE entryorguid = {} AND source_type = 0 "
+        "AND action_type IN (11, 85) AND action_param1 != 0",
+        creatureEntry);
+    if (result)
+    {
+        do
+        {
+            uint32 spellId = (*result)[0].Get<uint32>();
+            if (sSpellMgr->GetSpellInfo(spellId))
+                spellSet.insert(spellId);
+        } while (result->NextRow());
+    }
+
+    // Resolve to difficulty-appropriate spell IDs and fill slots
+    uint32 slot = 0;
+    for (uint32 spellId : spellSet)
+    {
+        if (slot >= MAX_GUARDIAN_SPELLS)
+            break;
+        uint32 resolved = creature ? sSpellMgr->GetSpellIdForDifficulty(spellId, creature) : spellId;
+        if (sSpellMgr->GetSpellInfo(resolved))
+            spells[slot++] = resolved;
     }
 }
 
@@ -3009,7 +3055,7 @@ public:
         uint8 capturedPowerType = target->getPowerType();
 
         uint32 spells[MAX_GUARDIAN_SPELLS];
-        PopulateDefaultSpells(entry, spells);
+        PopulateDefaultSpells(entry, spells, target);
 
         target->DespawnOrUnsummon();
 
@@ -3868,7 +3914,7 @@ public:
                     uint8 capturedPowerType = target->getPowerType();
 
                     uint32 spells[MAX_GUARDIAN_SPELLS];
-                    PopulateDefaultSpells(entry, spells);
+                    PopulateDefaultSpells(entry, spells, target);
 
                     target->DespawnOrUnsummon();
 
