@@ -158,6 +158,8 @@ local function GetSelectedData()
     return nil
 end
 
+local CancelSwapMode  -- forward declaration; defined after slotButtons
+
 -- ============================================================================
 -- Main Panel: Spellbook
 -- ============================================================================
@@ -171,6 +173,7 @@ spellbook:SetBackdropColor(0.05, 0.1, 0.12, 0.9)
 spellbook:SetBackdropBorderColor(0.15, 0.45, 0.45, 1)
 spellbook:SetFrameStrata("MEDIUM")
 MakeMovable(spellbook, "spellbook")
+spellbook:SetScript("OnHide", function() CancelSwapMode() end)
 spellbook:Hide()
 
 -- Title
@@ -208,6 +211,7 @@ for i = 0, MAX_SLOTS - 1 do
 
     tab:SetScript("OnClick", function()
         if guardians[i].hasGuardian then
+            CancelSwapMode()
             selectedSlot = i
             RefreshSpellbook()
         end
@@ -269,7 +273,26 @@ StaticPopupDialogs["CCAPTURE_TEACH_SLOT"] = {
 
 local slotButtons = {}
 local xButtons = {}
-local dragSourceSlot = nil  -- set when dragging from our own spell bar
+local swapSourceSlot = nil  -- slot index (1-8) when in two-click swap mode
+
+local function SetSlotSwapHighlight(slotIdx, active)
+    local btn = slotButtons[slotIdx]
+    if not btn then return end
+    if active then
+        btn.border:SetVertexColor(1, 0.8, 0)
+        btn.border:SetAlpha(1.0)
+    else
+        btn.border:SetVertexColor(1, 1, 1)
+        btn.border:SetAlpha(0.6)
+    end
+end
+
+CancelSwapMode = function()
+    if swapSourceSlot then
+        SetSlotSwapHighlight(swapSourceSlot, false)
+        swapSourceSlot = nil
+    end
+end
 
 for i = 1, NUM_SPELL_SLOTS do
     local slotBtn = CreateFrame("Button", "CaptureSpellSlot" .. i, spellbook)
@@ -306,83 +329,60 @@ for i = 1, NUM_SPELL_SLOTS do
     numLabel:SetText(i)
     numLabel:SetTextColor(0.7, 0.7, 0.7, 0.5)
 
-    -- Enable drag-to-teach: accept spells dropped onto the slot
     slotBtn:EnableMouse(true)
     slotBtn:RegisterForDrag("LeftButton")
 
-    -- Drag FROM slot: track source for internal swap, also allows placing on action bar
-    slotBtn:SetScript("OnDragStart", function(self)
-        local d = GetSelectedData()
-        if d then
-            local spellId = d.spellSlots[i]
-            if spellId > 0 and not InCombatLockdown() then
-                local idx = FindSpellBookIndex(spellId)
-                if idx then
-                    dragSourceSlot = i
-                    PickupSpell(idx, BOOKTYPE_SPELL)
-                end
-            end
-        end
-    end)
-
-    -- Drop ON slot: swap with source slot if internal drag, otherwise teach
+    -- Drop ON slot: teach a spell from cursor
     slotBtn:SetScript("OnReceiveDrag", function(self)
         if InCombatLockdown() then return end
         local d = GetSelectedData()
-        if not d then dragSourceSlot = nil; return end
-
+        if not d then CancelSwapMode(); return end
         local spellId, spellName = GetSpellIdFromCursor()
-        if spellId and dragSourceSlot and dragSourceSlot ~= i
-                and spellId == d.spellSlots[dragSourceSlot] then
-            -- Internal reorder: swap the two slots
-            ClearCursor()
-            local src = dragSourceSlot
-            dragSourceSlot = nil
-            local tmp = d.spellSlots[src]
-            d.spellSlots[src] = d.spellSlots[i]
-            d.spellSlots[i] = tmp
-            RefreshSpellbook()
-            SendChatMessage(".capture swap " .. src .. " " .. i, "SAY")
-        elseif spellId and spellName then
-            dragSourceSlot = nil
+        if spellId and spellName then
+            CancelSwapMode()
             ClearCursor()
             local dialog = StaticPopup_Show("CCAPTURE_TEACH_SLOT",
                 spellName .. " (slot " .. i .. ")", d.guardianName)
             if dialog then
                 dialog.data = {slot = i, spellId = spellId}
             end
-        else
-            dragSourceSlot = nil
         end
     end)
 
-    -- Also handle OnClick with cursor holding a spell
+    -- Click: teach (cursor has spell), complete swap, or enter swap mode
     slotBtn:SetScript("OnClick", function(self, button)
         if InCombatLockdown() then return end
         local d = GetSelectedData()
-        if not d then dragSourceSlot = nil; return end
+        if not d then CancelSwapMode(); return end
 
         local spellId, spellName = GetSpellIdFromCursor()
-        if spellId and dragSourceSlot and dragSourceSlot ~= i
-                and spellId == d.spellSlots[dragSourceSlot] then
-            ClearCursor()
-            local src = dragSourceSlot
-            dragSourceSlot = nil
-            local tmp = d.spellSlots[src]
-            d.spellSlots[src] = d.spellSlots[i]
-            d.spellSlots[i] = tmp
-            RefreshSpellbook()
-            SendChatMessage(".capture swap " .. src .. " " .. i, "SAY")
-        elseif spellId and spellName then
-            dragSourceSlot = nil
+        if spellId and spellName then
+            -- Cursor has a player spell: teach it
+            CancelSwapMode()
             ClearCursor()
             local dialog = StaticPopup_Show("CCAPTURE_TEACH_SLOT",
                 spellName .. " (slot " .. i .. ")", d.guardianName)
             if dialog then
                 dialog.data = {slot = i, spellId = spellId}
             end
-        else
-            dragSourceSlot = nil
+        elseif swapSourceSlot then
+            if swapSourceSlot == i then
+                -- Clicked the same slot: cancel
+                CancelSwapMode()
+            else
+                -- Clicked a different slot: complete swap
+                local src = swapSourceSlot
+                CancelSwapMode()
+                local tmp = d.spellSlots[src]
+                d.spellSlots[src] = d.spellSlots[i]
+                d.spellSlots[i] = tmp
+                RefreshSpellbook()
+                SendChatMessage(".capture swap " .. src .. " " .. i, "SAY")
+            end
+        elseif d.spellSlots[i] > 0 then
+            -- No swap pending and slot is filled: enter swap mode
+            swapSourceSlot = i
+            SetSlotSwapHighlight(i, true)
         end
     end)
 
