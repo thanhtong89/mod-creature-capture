@@ -3006,6 +3006,7 @@ public:
             { "spawn",      HandleSpawnCommand,      SEC_GAMEMASTER,    Console::No },
             { "teach",      HandleTeachCommand,      SEC_PLAYER,        Console::No },
             { "unlearn",    HandleUnlearnCommand,    SEC_PLAYER,        Console::No },
+            { "swap",       HandleSwapCommand,       SEC_PLAYER,        Console::No },
             { "feed",       HandleFeedCommand,       SEC_PLAYER,        Console::No },
             { "feedpreview", HandleFeedPreviewCommand, SEC_PLAYER,       Console::No },
         };
@@ -3440,6 +3441,56 @@ public:
 
         handler->PSendSysMessage("|cff00ff00[Guardian]|r Unlearned {} from slot {}.", spellName, slot);
 
+        SendGuardianSpells(player, static_cast<uint8>(guardianSlot), s.spellSlots);
+
+        return true;
+    }
+
+    static bool HandleSwapCommand(ChatHandler* handler, uint32 slot1, uint32 slot2)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        if (!player)
+            return false;
+
+        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+        int8 guardianSlot = FindTargetedGuardianSlot(player, data);
+
+        if (guardianSlot < 0)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Target one of your guardians first.");
+            return true;
+        }
+
+        GuardianSlotData& s = data->slots[guardianSlot];
+        if (!s.IsActive())
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r That guardian is not currently summoned.");
+            return true;
+        }
+
+        if (slot1 < 1 || slot1 > MAX_GUARDIAN_SPELLS || slot2 < 1 || slot2 > MAX_GUARDIAN_SPELLS || slot1 == slot2)
+        {
+            handler->PSendSysMessage("|cffff0000[Guardian]|r Invalid slots (1-{}).", MAX_GUARDIAN_SPELLS);
+            return true;
+        }
+
+        uint32 idx1 = slot1 - 1;
+        uint32 idx2 = slot2 - 1;
+
+        std::swap(s.spellSlots[idx1], s.spellSlots[idx2]);
+
+        Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid);
+        if (guardian)
+        {
+            CapturedGuardianAI* ai = dynamic_cast<CapturedGuardianAI*>(guardian->AI());
+            if (ai)
+            {
+                ai->SetSpell(idx1, s.spellSlots[idx1]);
+                ai->SetSpell(idx2, s.spellSlots[idx2]);
+            }
+        }
+
+        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(guardianSlot));
         SendGuardianSpells(player, static_cast<uint8>(guardianSlot), s.spellSlots);
 
         return true;
