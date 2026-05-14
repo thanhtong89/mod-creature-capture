@@ -173,7 +173,7 @@ spellbook:SetBackdropColor(0.05, 0.1, 0.12, 0.9)
 spellbook:SetBackdropBorderColor(0.15, 0.45, 0.45, 1)
 spellbook:SetFrameStrata("MEDIUM")
 MakeMovable(spellbook, "spellbook")
-spellbook:SetScript("OnHide", function() CancelSwapMode() end)
+spellbook:SetScript("OnHide", function() if CancelSwapMode then CancelSwapMode() end end)
 spellbook:Hide()
 
 -- Title
@@ -567,10 +567,6 @@ function RefreshSpellbook()
         end
     end
 
-    -- Only show if a guardian is actively selected (targeted)
-    if selectedSlot >= 0 then
-        spellbook:Show()
-    end
 end
 
 -- ============================================================================
