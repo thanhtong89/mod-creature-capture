@@ -892,6 +892,9 @@ public:
                                 return;
                             }
                         }
+
+                        // DPS: heal self or guardians out of combat if anyone is hurt
+                        DoCastEmergencyHeals(80.0f);
                     }
                 }
             }
@@ -1272,18 +1275,22 @@ private:
 
         DoMeleeAttackIfReady();
 
-        // Priority 1: Buff allies (owner + other guardians + self) — e.g. Fire Shield
+        // Priority 1: Emergency heal self or a fellow guardian below 35%
+        if (DoCastEmergencyHeals())
+            return;
+
+        // Priority 2: Buff allies (owner + other guardians + self) — e.g. Fire Shield
         if (DoCastAllyBuffs())
             return;
 
-        // Priority 2: Self buffs
+        // Priority 3: Self buffs
         if (DoCastSelfBuffs())
             return;
 
-        // Priority 3: Debuffs on current target
+        // Priority 4: Debuffs on current target
         DoCastDebuffSpells();
 
-        // Priority 4: Offensive damage spells
+        // Priority 5: Offensive damage spells
         DoCastOffensiveSpells();
     }
 
@@ -1350,19 +1357,23 @@ private:
             }
         }
 
-        // Priority 1: Ranged offensive spells
+        // Priority 1: Emergency heal self or a fellow guardian below 35%
+        if (DoCastEmergencyHeals())
+            return;
+
+        // Priority 2: Ranged offensive spells
         if (DoCastRangedOffensiveSpells())
             return;
 
-        // Priority 2: Buff allies
+        // Priority 3: Buff allies
         if (DoCastAllyBuffs())
             return;
 
-        // Priority 3: Self buffs
+        // Priority 4: Self buffs
         if (DoCastSelfBuffs())
             return;
 
-        // Priority 4: Debuffs on current target
+        // Priority 5: Debuffs on current target
         DoCastDebuffSpells();
 
         // Fallback: melee if enemy is close
@@ -1601,6 +1612,76 @@ private:
 
             me->CastSpell(target, spellId, false);
             ApplySpellCooldown(spellId, spellInfo, false);
+            return true;
+        }
+
+        return false;
+    }
+
+    // DPS emergency heals: cast healing spells on self or fellow guardians below threshold.
+    // Does not heal the owner — player is trusted to manage themselves.
+    bool DoCastEmergencyHeals(float threshold = 35.0f)
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING))
+            return false;
+
+        Unit* healTarget = nullptr;
+        float lowestPct  = threshold;
+
+        auto Check = [&](Unit* u)
+        {
+            if (!u || !u->IsAlive()) return;
+            float pct = u->GetHealthPct();
+            if (pct < lowestPct)
+            {
+                lowestPct  = pct;
+                healTarget = u;
+            }
+        };
+
+        Check(me);
+        if (_owner)
+        {
+            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
+            {
+                GuardianSlotData& s = data->slots[i];
+                if (!s.IsActive() || s.guardianGuid == me->GetGUID())
+                    continue;
+                Check(ObjectAccessor::GetCreature(*me, s.guardianGuid));
+            }
+        }
+
+        if (!healTarget)
+            return false;
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId) continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo) continue;
+
+            bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+            bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+            if (!isDirectHeal && !isHoT)
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            if (isHoT && healTarget->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            float maxRange = spellInfo->GetMaxRange(true);
+            if (maxRange > 0.0f && !me->IsWithinDist(healTarget, maxRange))
+                continue;
+            if (!me->IsWithinLOSInMap(healTarget))
+                continue;
+
+            me->CastSpell(healTarget, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo, true);
             return true;
         }
 
