@@ -701,8 +701,11 @@ public:
                 }
                 else if (_archetype == ARCHETYPE_TANK)
                 {
-                    // Tank: switch to peel mobs attacking owner
+                    // Tank: switch to peel mobs attacking owner or pet
                     Unit* ownerAttacker = _owner->getAttackerForHelper();
+                    if (!ownerAttacker)
+                        if (Pet* pet = _owner->GetPet())
+                            ownerAttacker = pet->getAttackerForHelper();
                     if (ownerAttacker && ownerAttacker != me->GetVictim() &&
                         ownerAttacker->IsAlive() && me->CanCreatureAttack(ownerAttacker))
                     {
@@ -782,10 +785,15 @@ public:
                 {
                     if (_archetype == ARCHETYPE_HEALER)
                     {
-                        // Healer: engage any tanked target from owner or allies
+                        // Healer: engage any tanked target from owner, pet, or allies
+                        Pet* ownerPet = _owner->GetPet();
+                        Unit* petAttacker = (ownerPet && ownerPet->IsAlive()) ? ownerPet->getAttackerForHelper() : nullptr;
+                        Unit* petVictim   = (ownerPet && ownerPet->IsAlive()) ? ownerPet->GetVictim() : nullptr;
                         Unit* candidates[] = {
                             _owner->getAttackerForHelper(),
                             _owner->GetVictim(),
+                            petAttacker,
+                            petVictim,
                             FindAllyTarget()
                         };
                         for (Unit* c : candidates)
@@ -797,19 +805,38 @@ public:
                             }
                         }
 
-                        // Healer: heal out of combat if owner is hurt
-                        if (_owner->IsAlive() && _owner->GetHealthPct() < 80.0f)
+                        // Healer: heal out of combat if owner, pet, or any ally is hurt
+                        auto needsHealing = [](Unit* u) { return u && u->IsAlive() && u->GetHealthPct() < 80.0f; };
+                        bool shouldHeal = needsHealing(_owner) || needsHealing(me);
+                        if (!shouldHeal && ownerPet)
+                            shouldHeal = needsHealing(ownerPet);
+                        if (!shouldHeal)
+                        {
+                            CapturedGuardianData* gdata = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+                            for (uint8 gi = 0; gi < MAX_GUARDIAN_SLOTS && !shouldHeal; ++gi)
+                            {
+                                GuardianSlotData& gs = gdata->slots[gi];
+                                if (!gs.IsActive() || gs.guardianGuid == me->GetGUID()) continue;
+                                Creature* ally = ObjectAccessor::GetCreature(*me, gs.guardianGuid);
+                                shouldHeal = needsHealing(ally);
+                            }
+                        }
+                        if (shouldHeal)
                             DoCastHealingSpells();
                     }
                     else if (_archetype == ARCHETYPE_TANK)
                     {
-                        // Tank: pull mobs off the player first
-                        if (Unit* attacker = _owner->getAttackerForHelper())
+                        // Tank: pull mobs off the player or pet first
+                        Unit* ownerOrPetAttacker = _owner->getAttackerForHelper();
+                        if (!ownerOrPetAttacker)
+                            if (Pet* pet = _owner->GetPet())
+                                ownerOrPetAttacker = pet->getAttackerForHelper();
+                        if (ownerOrPetAttacker)
                         {
-                            if (me->CanCreatureAttack(attacker))
+                            if (me->CanCreatureAttack(ownerOrPetAttacker))
                             {
-                                me->AddThreat(attacker, 200.0f);
-                                AttackStart(attacker);
+                                me->AddThreat(ownerOrPetAttacker, 200.0f);
+                                AttackStart(ownerOrPetAttacker);
                                 return;
                             }
                         }
@@ -835,10 +862,15 @@ public:
                     }
                     else
                     {
-                        // DPS: owner's target, owner's attacker, ally's attacker
+                        // DPS: owner's target, owner's attacker, pet's attacker, ally's attacker
+                        Pet* ownerPet = _owner->GetPet();
+                        Unit* petTarget   = (ownerPet && ownerPet->IsAlive()) ? ownerPet->GetVictim() : nullptr;
+                        Unit* petAttacker = (ownerPet && ownerPet->IsAlive()) ? ownerPet->getAttackerForHelper() : nullptr;
                         Unit* candidates[] = {
                             _owner->GetVictim(),
                             _owner->getAttackerForHelper(),
+                            petTarget,
+                            petAttacker,
                             FindAllyAttacker()
                         };
                         for (Unit* c : candidates)
@@ -1109,12 +1141,25 @@ private:
         _recoveryRange = biggestMin + 3.0f;
     }
 
-    // Find an enemy attacking a fellow guardian.
+    // Find an enemy attacking a fellow guardian or the owner's pet.
     // If excludeTanks is true, skips guardians with tank archetype (for tank peeling).
     Unit* FindAllyAttacker(bool excludeTanks = false)
     {
         if (!_owner)
             return nullptr;
+
+        // Check owner's pet first
+        if (Pet* pet = _owner->GetPet())
+        {
+            if (pet->IsAlive())
+            {
+                for (Unit* attacker : pet->getAttackers())
+                {
+                    if (attacker && attacker->IsAlive() && me->CanCreatureAttack(attacker))
+                        return attacker;
+                }
+            }
+        }
 
         CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
@@ -1138,11 +1183,22 @@ private:
         return nullptr;
     }
 
-    // Find a target that a fellow guardian is actively fighting
+    // Find a target that a fellow guardian or the owner's pet is actively fighting
     Unit* FindAllyTarget()
     {
         if (!_owner)
             return nullptr;
+
+        // Check owner's pet first
+        if (Pet* pet = _owner->GetPet())
+        {
+            if (pet->IsAlive() && pet->IsInCombat())
+            {
+                Unit* petTarget = pet->GetVictim();
+                if (petTarget && petTarget->IsAlive() && me->CanCreatureAttack(petTarget))
+                    return petTarget;
+            }
+        }
 
         CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
@@ -1578,6 +1634,7 @@ private:
             if (_owner)
             {
                 CheckCritical(_owner);
+                CheckCritical(_owner->GetPet());
                 CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
                 for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
                 {
@@ -1619,6 +1676,21 @@ private:
                             nonTankLowest = pct;
                             nonTankTarget = ally;
                         }
+                    }
+                }
+            }
+
+            // Also consider owner's pet as a non-tank candidate
+            if (_owner)
+            {
+                Pet* pet = _owner->GetPet();
+                if (pet && pet->IsAlive() && pet->GetHealthPct() < 50.0f)
+                {
+                    float pct = pet->GetHealthPct();
+                    if (pct < nonTankLowest)
+                    {
+                        nonTankLowest = pct;
+                        nonTankTarget = pet;
                     }
                 }
             }
