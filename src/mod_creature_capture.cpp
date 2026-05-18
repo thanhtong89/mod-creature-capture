@@ -61,17 +61,19 @@ static const float GUARDIAN_FOLLOW_ANGLES[MAX_GUARDIAN_SLOTS] = {
 };
 
 // Gossip action encoding for Tesseract item:
-//   encoded = slot * 10 + action   (actions 1-4)
+//   encoded = slot * 10 + action   (actions 1-6)
 //   decode:  slot = encoded / 10,  action = encoded % 10
 enum TesseractGossipActions
 {
-    TESSERACT_ACTION_SUMMON  = 1,
-    TESSERACT_ACTION_DISMISS = 2,
-    TESSERACT_ACTION_INFO    = 3,
-    TESSERACT_ACTION_RELEASE     = 4,
-    TESSERACT_ACTION_SUMMON_ALL  = 97,
-    TESSERACT_ACTION_DISMISS_ALL = 98,
-    TESSERACT_ACTION_CLOSE       = 99
+    TESSERACT_ACTION_SUMMON          = 1,
+    TESSERACT_ACTION_DISMISS         = 2,
+    TESSERACT_ACTION_INFO            = 3,
+    TESSERACT_ACTION_RELEASE         = 4,  // shows confirm sub-menu
+    TESSERACT_ACTION_RELEASE_PRESERVE = 5, // release + keep spells/stats for next occupant
+    TESSERACT_ACTION_RELEASE_WIPE    = 6,  // release + erase everything
+    TESSERACT_ACTION_SUMMON_ALL      = 97,
+    TESSERACT_ACTION_DISMISS_ALL     = 98,
+    TESSERACT_ACTION_CLOSE           = 99
 };
 
 // Guardian gossip action encoding:
@@ -143,6 +145,14 @@ static uint32 CalculateResourceSwitchCost(uint8 level)
 {
     double cost = std::pow(1.07, static_cast<double>(level));
     return static_cast<uint32>(cost * 10000); // gold to copper
+}
+
+// Cost in copper to preserve a slot's progress on release: floor(0.5 * 1.1^level) gold.
+// Returns 0 for very low levels (effectively free).
+static uint32 CalculatePreserveCost(uint8 level)
+{
+    uint32 gold = static_cast<uint32>(std::floor(0.5 * std::pow(1.1, static_cast<double>(level))));
+    return gold * 10000;
 }
 
 // ============================================================================
@@ -372,6 +382,41 @@ struct GuardianSlotData
         bonusResFrost = 0;
         bonusResShadow = 0;
         bonusResArcane = 0;
+    }
+
+    // Clears the creature identity and resets archetype, but preserves accumulated
+    // spells and bonus stats so the next guardian captured here inherits them.
+    void ClearCreature()
+    {
+        guardianGuid.Clear();
+        guardianEntry = 0;
+        guardianLevel = 0;
+        guardianHealth = 0;
+        guardianPower = 0;
+        guardianPowerType = 0;
+        archetype = ARCHETYPE_DPS;
+        displayId = 0;
+        equipmentId = 0;
+        powerChosen = false;
+        rangedDps = false;
+        dismissed = false;
+        savedToDb = false;
+        // spellSlots and all bonus stats intentionally preserved
+    }
+
+    bool HasPreservedProgress() const
+    {
+        for (int i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+            if (spellSlots[i] != 0)
+                return true;
+        return bonusStrength != 0 || bonusAgility != 0 || bonusIntellect != 0 || bonusStamina != 0
+            || bonusAttackPower != 0 || bonusSpellPower != 0 || bonusCritRating != 0
+            || bonusDodgeRating != 0 || bonusParryRating != 0 || bonusHasteRating != 0
+            || bonusHitRating != 0 || bonusArmorPenRating != 0 || bonusExpertiseRating != 0
+            || bonusBlockRating != 0 || bonusBlockValue != 0
+            || bonusArmor != 0 || bonusWeaponDmg != 0.0f
+            || bonusResHoly != 0 || bonusResFire != 0 || bonusResNature != 0
+            || bonusResFrost != 0 || bonusResShadow != 0 || bonusResArcane != 0;
     }
 
     bool IsOccupied() const { return guardianEntry != 0; }
@@ -2309,7 +2354,10 @@ static void PopulateDefaultSpells(uint32 creatureEntry, uint32* spells, Creature
 
 static void SaveGuardianSlotToDb(Player* player, GuardianSlotData* slotData, uint8 slotIndex)
 {
-    if (!slotData || slotData->guardianEntry == 0)
+    if (!slotData)
+        return;
+    // Skip saving if empty AND nothing worth preserving
+    if (slotData->guardianEntry == 0 && !slotData->HasPreservedProgress())
         return;
 
     uint32 ownerGuid = player->GetGUID().GetCounter();
@@ -3216,8 +3264,13 @@ public:
         int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
         uint8 capturedPowerType = target->getPowerType();
 
+        // If the slot has preserved progress, carry its spells forward; otherwise seed from creature defaults.
+        GuardianSlotData& s = data->slots[emptySlot];
         uint32 spells[MAX_GUARDIAN_SPELLS];
-        PopulateDefaultSpells(entry, spells, target);
+        if (s.HasPreservedProgress())
+            memcpy(spells, s.spellSlots, sizeof(spells));
+        else
+            PopulateDefaultSpells(entry, spells, target);
 
         target->DespawnOrUnsummon();
 
@@ -3229,7 +3282,6 @@ public:
             return true;
         }
 
-        GuardianSlotData& s = data->slots[emptySlot];
         s.guardianGuid      = guardian->GetGUID();
         s.guardianEntry     = entry;
         s.guardianLevel     = level;
@@ -3239,7 +3291,9 @@ public:
         s.archetype         = ARCHETYPE_DPS;
         s.displayId         = capturedDisplayId;
         s.equipmentId       = capturedEquipmentId;
-        memcpy(s.spellSlots, spells, sizeof(spells));
+        // spellSlots already set (either preserved or fresh defaults via SummonCapturedGuardian)
+        if (!s.HasPreservedProgress())
+            memcpy(s.spellSlots, spells, sizeof(spells));
 
         SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
 
@@ -3272,8 +3326,12 @@ public:
         }
 
         uint8 level = player->GetLevel();
+        GuardianSlotData& s = data->slots[emptySlot];
         uint32 spells[MAX_GUARDIAN_SPELLS];
-        PopulateDefaultSpells(creatureEntry, spells);
+        if (s.HasPreservedProgress())
+            memcpy(spells, s.spellSlots, sizeof(spells));
+        else
+            PopulateDefaultSpells(creatureEntry, spells);
 
         TempSummon* guardian = SummonCapturedGuardian(player, creatureEntry, level, ARCHETYPE_DPS, spells,
             static_cast<uint8>(emptySlot));
@@ -3283,7 +3341,6 @@ public:
             return true;
         }
 
-        GuardianSlotData& s = data->slots[emptySlot];
         s.guardianGuid      = guardian->GetGUID();
         s.guardianEntry     = creatureEntry;
         s.guardianLevel     = level;
@@ -3293,7 +3350,8 @@ public:
         s.archetype         = ARCHETYPE_DPS;
         s.displayId         = guardian->GetDisplayId();
         s.equipmentId       = 0;
-        memcpy(s.spellSlots, spells, sizeof(spells));
+        if (!s.HasPreservedProgress())
+            memcpy(s.spellSlots, spells, sizeof(spells));
 
         SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
 
@@ -4132,8 +4190,12 @@ public:
                     int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
                     uint8 capturedPowerType = target->getPowerType();
 
+                    GuardianSlotData& s = data->slots[emptySlot];
                     uint32 spells[MAX_GUARDIAN_SPELLS];
-                    PopulateDefaultSpells(entry, spells, target);
+                    if (s.HasPreservedProgress())
+                        memcpy(spells, s.spellSlots, sizeof(spells));
+                    else
+                        PopulateDefaultSpells(entry, spells, target);
 
                     target->DespawnOrUnsummon();
 
@@ -4141,7 +4203,6 @@ public:
                         static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId, capturedPowerType);
                     if (guardian)
                     {
-                        GuardianSlotData& s = data->slots[emptySlot];
                         s.guardianGuid      = guardian->GetGUID();
                         s.guardianEntry     = entry;
                         s.guardianLevel     = level;
@@ -4151,7 +4212,8 @@ public:
                         s.archetype         = ARCHETYPE_DPS;
                         s.displayId         = capturedDisplayId;
                         s.equipmentId       = capturedEquipmentId;
-                        memcpy(s.spellSlots, spells, sizeof(spells));
+                        if (!s.HasPreservedProgress())
+                            memcpy(s.spellSlots, spells, sizeof(spells));
 
                         SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
 
@@ -4255,18 +4317,20 @@ public:
         return true;
     }
 
-    void OnGossipSelect(Player* player, Item* /*item*/, uint32 /*sender*/, uint32 action) override
+    void OnGossipSelect(Player* player, Item* item, uint32 /*sender*/, uint32 action) override
     {
-        CloseGossipMenuFor(player);
-
         if (action == TESSERACT_ACTION_CLOSE || action == 0)
+        {
+            CloseGossipMenuFor(player);
             return;
+        }
 
         CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
 
         // Handle bulk actions
         if (action == TESSERACT_ACTION_SUMMON_ALL)
         {
+            CloseGossipMenuFor(player);
             uint32 count = 0;
             for (uint8 i = 0; i < config.maxSlots; ++i)
             {
@@ -4280,18 +4344,22 @@ public:
 
         if (action == TESSERACT_ACTION_DISMISS_ALL)
         {
+            CloseGossipMenuFor(player);
             DismissAllGuardians(player);
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00[Tesseract]|r All guardians dismissed.");
             return;
         }
 
-        // Decode slot and action
+        // Decode slot and per-slot action
         uint8 slot = action / 10;
         uint8 localAction = action % 10;
 
         if (slot >= MAX_GUARDIAN_SLOTS)
+        {
+            CloseGossipMenuFor(player);
             return;
+        }
 
         GuardianSlotData& s = data->slots[slot];
 
@@ -4299,6 +4367,7 @@ public:
         {
             case TESSERACT_ACTION_SUMMON:
             {
+                CloseGossipMenuFor(player);
                 if (!s.IsOccupied())
                 {
                     ChatHandler(player->GetSession()).PSendSysMessage("No guardian in slot {}.", slot + 1);
@@ -4326,6 +4395,7 @@ public:
             }
             case TESSERACT_ACTION_DISMISS:
             {
+                CloseGossipMenuFor(player);
                 if (!s.IsActive())
                 {
                     ChatHandler(player->GetSession()).PSendSysMessage("No active guardian in slot {}.", slot + 1);
@@ -4339,6 +4409,55 @@ public:
             }
             case TESSERACT_ACTION_RELEASE:
             {
+                // Show a 3-option confirmation sub-menu instead of acting immediately
+                if (!s.IsOccupied())
+                {
+                    CloseGossipMenuFor(player);
+                    return;
+                }
+
+                CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry);
+                std::string name = cInfo ? cInfo->Name : "Guardian";
+
+                uint32 preserveCost = CalculatePreserveCost(player->GetLevel());
+                std::string preserveLabel;
+                if (preserveCost == 0)
+                    preserveLabel = "Preserve slot progress (free) — new guardian inherits spells & stats";
+                else
+                {
+                    uint32 gold = preserveCost / 10000;
+                    preserveLabel = "Preserve slot progress (" + std::to_string(gold) + "g) — new guardian inherits spells & stats";
+                }
+
+                ClearGossipMenuFor(player);
+                AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, preserveLabel,
+                    GOSSIP_SENDER_MAIN, slot * 10 + TESSERACT_ACTION_RELEASE_PRESERVE,
+                    "Release " + name + " but keep all accumulated spells and bonus stats for the next guardian captured here?",
+                    preserveCost, false);
+                AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Wipe clean (free) — erase all slot progress",
+                    GOSSIP_SENDER_MAIN, slot * 10 + TESSERACT_ACTION_RELEASE_WIPE,
+                    "Permanently release " + name + " and erase all accumulated spells and stats from this slot?",
+                    0, false);
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Cancel",
+                    GOSSIP_SENDER_MAIN, TESSERACT_ACTION_CLOSE);
+                SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, item->GetGUID());
+                break;
+            }
+            case TESSERACT_ACTION_RELEASE_PRESERVE:
+            {
+                CloseGossipMenuFor(player);
+                if (!s.IsOccupied())
+                    return;
+
+                uint32 preserveCost = CalculatePreserveCost(player->GetLevel());
+                if (player->GetMoney() < preserveCost)
+                {
+                    uint32 gold = preserveCost / 10000;
+                    ChatHandler(player->GetSession()).PSendSysMessage(
+                        "|cffff0000[Tesseract]|r Not enough gold. Cost: {}g.", gold);
+                    return;
+                }
+
                 std::string name = "Guardian";
                 if (s.IsActive())
                 {
@@ -4348,22 +4467,51 @@ public:
                         guardian->DespawnOrUnsummon();
                     }
                 }
-                else if (s.IsOccupied())
+                else if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry))
+                    name = cInfo->Name;
+
+                if (preserveCost > 0)
+                    player->ModifyMoney(-static_cast<int32>(preserveCost));
+
+                s.ClearCreature();
+                // Persist the preserved spells/stats so they survive relog
+                SaveGuardianSlotToDb(player, &s, slot);
+
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff6600[Tesseract]|r {} released. Slot progress preserved for the next guardian.", name);
+
+                SendGuardianClear(player, slot);
+                break;
+            }
+            case TESSERACT_ACTION_RELEASE_WIPE:
+            {
+                CloseGossipMenuFor(player);
+                if (!s.IsOccupied())
+                    return;
+
+                std::string name = "Guardian";
+                if (s.IsActive())
                 {
-                    if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry))
-                        name = cInfo->Name;
+                    if (Creature* guardian = ObjectAccessor::GetCreature(*player, s.guardianGuid))
+                    {
+                        name = guardian->GetName();
+                        guardian->DespawnOrUnsummon();
+                    }
                 }
+                else if (CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(s.guardianEntry))
+                    name = cInfo->Name;
 
                 s.Clear();
                 DeleteGuardianSlotFromDb(player, slot);
 
                 ChatHandler(player->GetSession()).PSendSysMessage(
-                    "|cffff6600[Tesseract]|r {} released from slot {}.", name, slot + 1);
+                    "|cffff6600[Tesseract]|r {} released. All slot progress erased.", name);
 
                 SendGuardianClear(player, slot);
                 break;
             }
             default:
+                CloseGossipMenuFor(player);
                 break;
         }
     }
