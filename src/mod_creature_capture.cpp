@@ -1712,13 +1712,14 @@ private:
 
             bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
             bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
-            if (!isDirectHeal && !isHoT)
+            bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
+            if (!isDirectHeal && !isHoT && !isShield)
                 continue;
 
             if (me->HasSpellCooldown(spellId))
                 continue;
 
-            if (isHoT && healTarget->HasAura(spellId, me->GetGUID()))
+            if ((isHoT || isShield) && healTarget->HasAura(spellId, me->GetGUID()))
                 continue;
 
             float maxRange = spellInfo->GetMaxRange(true);
@@ -1774,63 +1775,37 @@ private:
             }
         }
 
-        // Phase 2: standard 50% thresholds — tank guardian > self > owner > non-tank (lowest HP)
+        // Phase 2: standard 50% threshold — pick lowest HP% across all allies
         if (!healTarget)
         {
-            Unit* tankTarget    = nullptr;
-            Unit* nonTankTarget = nullptr;
-            float nonTankLowest = 100.0f;
+            float lowestStandard = 50.0f;
 
+            auto CheckStandard = [&](Unit* u)
+            {
+                if (!u || !u->IsAlive())
+                    return;
+                float pct = u->GetHealthPct();
+                if (pct < lowestStandard)
+                {
+                    lowestStandard = pct;
+                    healTarget = u;
+                }
+            };
+
+            CheckStandard(me);
             if (_owner)
             {
+                CheckStandard(_owner);
+                CheckStandard(_owner->GetPet());
                 CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
                 for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
                 {
                     GuardianSlotData& s = data->slots[i];
                     if (!s.IsActive() || s.guardianGuid == me->GetGUID())
                         continue;
-
-                    Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
-                    if (!ally || !ally->IsAlive() || ally->GetHealthPct() >= 50.0f)
-                        continue;
-
-                    if (s.archetype == ARCHETYPE_TANK && !tankTarget)
-                        tankTarget = ally;
-                    else if (s.archetype != ARCHETYPE_TANK)
-                    {
-                        float pct = ally->GetHealthPct();
-                        if (pct < nonTankLowest)
-                        {
-                            nonTankLowest = pct;
-                            nonTankTarget = ally;
-                        }
-                    }
+                    CheckStandard(ObjectAccessor::GetCreature(*me, s.guardianGuid));
                 }
             }
-
-            // Also consider owner's pet as a non-tank candidate
-            if (_owner)
-            {
-                Pet* pet = _owner->GetPet();
-                if (pet && pet->IsAlive() && pet->GetHealthPct() < 50.0f)
-                {
-                    float pct = pet->GetHealthPct();
-                    if (pct < nonTankLowest)
-                    {
-                        nonTankLowest = pct;
-                        nonTankTarget = pet;
-                    }
-                }
-            }
-
-            if (tankTarget)
-                healTarget = tankTarget;
-            else if (me->GetHealthPct() < 50.0f)
-                healTarget = me;
-            else if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 50.0f)
-                healTarget = _owner;
-            else
-                healTarget = nonTankTarget;
         }
 
         if (!healTarget)
@@ -1847,15 +1822,16 @@ private:
                 continue;
 
             bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
-            bool isHoT = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
-            if (!isDirectHeal && !isHoT)
+            bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+            bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
+            if (!isDirectHeal && !isHoT && !isShield)
                 continue;
 
             if (me->HasSpellCooldown(spellId))
                 continue;
 
-            // Don't reapply HoTs that are still ticking on the target
-            if (isHoT && healTarget->HasAura(spellId, me->GetGUID()))
+            // Don't reapply HoTs or shields already active on the target
+            if ((isHoT || isShield) && healTarget->HasAura(spellId, me->GetGUID()))
                 continue;
 
             // Skip if target is out of range or line of sight
