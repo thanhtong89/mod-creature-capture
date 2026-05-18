@@ -2664,11 +2664,18 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
         return false;
     }
 
-    int32 levelDiff = static_cast<int32>(target->GetLevel()) - static_cast<int32>(player->GetLevel());
-    if (levelDiff > config.maxLevelDiff)
+    // Bosses are exempt from the level-diff cap: their stored DB level is often
+    // artificially high (e.g. city leaders set to 93 to be unkillable) and bears
+    // no relation to their intended difficulty.
+    bool isBossRank = (cInfo->rank == CREATURE_ELITE_WORLDBOSS);
+    if (!isBossRank || !config.allowBoss)
     {
-        error = "Creature level is too high for you to capture.";
-        return false;
+        int32 levelDiff = static_cast<int32>(target->GetLevel()) - static_cast<int32>(player->GetLevel());
+        if (levelDiff > config.maxLevelDiff)
+        {
+            error = "Creature level is too high for you to capture.";
+            return false;
+        }
     }
 
     // Skip the combat check for friendly targets — they never attack the player
