@@ -165,7 +165,8 @@ struct CreatureCaptureConfig
     bool announce = true;
     uint32 guardianDuration = 0;
     bool allowElite = false;
-    bool allowRare = true;
+    bool allowBoss  = true;
+    bool allowRare  = true;
     int32 maxLevelDiff = 5;
     uint8 minCreatureLevel = 1;
     uint32 healthPct = 100;
@@ -180,7 +181,8 @@ struct CreatureCaptureConfig
         announce = sConfigMgr->GetOption<bool>("CreatureCapture.Announce", true);
         guardianDuration = sConfigMgr->GetOption<uint32>("CreatureCapture.GuardianDuration", 0);
         allowElite = sConfigMgr->GetOption<bool>("CreatureCapture.AllowElite", false);
-        allowRare = sConfigMgr->GetOption<bool>("CreatureCapture.AllowRare", true);
+        allowBoss  = sConfigMgr->GetOption<bool>("CreatureCapture.AllowBoss",  true);
+        allowRare  = sConfigMgr->GetOption<bool>("CreatureCapture.AllowRare",  true);
         maxLevelDiff = sConfigMgr->GetOption<int32>("CreatureCapture.MaxLevelDiff", 5);
         minCreatureLevel = sConfigMgr->GetOption<uint8>("CreatureCapture.MinCreatureLevel", 1);
         healthPct = sConfigMgr->GetOption<uint32>("CreatureCapture.HealthPct", 100);
@@ -2633,9 +2635,15 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
         return false;
     }
 
-    if (cInfo->rank == CREATURE_ELITE_ELITE ||
-        cInfo->rank == CREATURE_ELITE_WORLDBOSS ||
-        cInfo->rank == CREATURE_ELITE_RAREELITE)
+    if (cInfo->rank == CREATURE_ELITE_WORLDBOSS)
+    {
+        if (!config.allowBoss)
+        {
+            error = "Cannot capture boss creatures.";
+            return false;
+        }
+    }
+    else if (cInfo->rank == CREATURE_ELITE_ELITE || cInfo->rank == CREATURE_ELITE_RAREELITE)
     {
         if (!config.allowElite)
         {

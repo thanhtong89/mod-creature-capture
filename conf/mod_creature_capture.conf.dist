@@ -17,9 +17,13 @@ CreatureCapture.Announce = 1
 # Default: 0
 CreatureCapture.GuardianDuration = 0
 
-# Allow capturing elite creatures
+# Allow capturing elite creatures (silver-dragon frame, rare-elites)
 # Default: 0 (disabled)
 CreatureCapture.AllowElite = 0
+
+# Allow capturing boss creatures (skull NPCs / world bosses / raid bosses)
+# Default: 1 (enabled)
+CreatureCapture.AllowBoss = 1
 
 # Allow capturing rare creatures
 # Default: 1 (enabled)
