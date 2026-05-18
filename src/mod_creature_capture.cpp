@@ -2164,10 +2164,13 @@ static void TryLeechFromKill(Player* owner, Creature* killed)
         {
             int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffSta * leechPct)));
             s.bonusStamina += gain;
-            // Apply STA change to live guardian immediately
+            // Apply STA change via modifier system so percentage auras stay correct
             uint32 hpGain = static_cast<uint32>(gain * 10);
-            guardian->SetMaxHealth(guardian->GetMaxHealth() + hpGain);
-            guardian->SetHealth(guardian->GetHealth() + hpGain);
+            guardian->SetStatFlatModifier(UNIT_MOD_HEALTH, TOTAL_VALUE,
+                static_cast<float>(GetBonusHealth(s)));
+            guardian->UpdateMaxHealth();
+            uint32 newMaxHP = guardian->GetMaxHealth();
+            guardian->SetHealth(std::min(guardian->GetHealth() + hpGain, newMaxHP));
             leeched = true;
             if (!msg.empty()) msg += ", ";
             msg += fmt::format("+{} STA", gain);
@@ -2178,12 +2181,16 @@ static void TryLeechFromKill(Player* owner, Creature* killed)
         {
             int32 gain = std::max(1, static_cast<int32>(std::ceil(mobEffInt * leechPct)));
             s.bonusIntellect += gain;
-            // Apply INT change to live guardian immediately (mana)
+            // Apply INT change via modifier system so percentage auras stay correct
             if (guardian->getPowerType() == POWER_MANA)
             {
                 uint32 manaGain = static_cast<uint32>(gain * 15);
-                guardian->SetMaxPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA) + manaGain);
-                guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + static_cast<int32>(manaGain));
+                guardian->SetStatFlatModifier(UNIT_MOD_MANA, TOTAL_VALUE,
+                    static_cast<float>(GetBonusMana(s)));
+                guardian->UpdateMaxPower(POWER_MANA);
+                uint32 newMaxMana = guardian->GetMaxPower(POWER_MANA);
+                guardian->SetPower(POWER_MANA,
+                    std::min(guardian->GetPower(POWER_MANA) + manaGain, newMaxMana));
             }
             leeched = true;
             if (!msg.empty()) msg += ", ";
@@ -2700,22 +2707,23 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
     {
         GuardianSlotData& slot = bonusData->slots[slotIndex];
 
-        // HP from STA
+        // HP from STA — register via modifier system so percentage auras
+        // (e.g. SPELL_AURA_MOD_INCREASE_HEALTH_PERCENT) recalculate correctly
         uint32 bonusHP = GetBonusHealth(slot);
         if (bonusHP > 0)
         {
-            uint32 newMax = guardian->GetMaxHealth() + bonusHP;
-            guardian->SetMaxHealth(newMax);
-            guardian->SetHealth(newMax);
+            guardian->SetStatFlatModifier(UNIT_MOD_HEALTH, TOTAL_VALUE, static_cast<float>(bonusHP));
+            guardian->UpdateMaxHealth();
+            guardian->SetHealth(guardian->GetMaxHealth());
         }
 
-        // Mana from INT
+        // Mana from INT — same reasoning
         uint32 bonusMana = GetBonusMana(slot);
         if (bonusMana > 0 && guardian->getPowerType() == POWER_MANA)
         {
-            uint32 newMax = guardian->GetMaxPower(POWER_MANA) + bonusMana;
-            guardian->SetMaxPower(POWER_MANA, newMax);
-            guardian->SetPower(POWER_MANA, newMax);
+            guardian->SetStatFlatModifier(UNIT_MOD_MANA, TOTAL_VALUE, static_cast<float>(bonusMana));
+            guardian->UpdateMaxPower(POWER_MANA);
+            guardian->SetPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA));
         }
 
         // Armor
@@ -3722,15 +3730,22 @@ public:
                 if (newHP > oldHP)
                 {
                     uint32 hpDelta = newHP - oldHP;
-                    guardian->SetMaxHealth(guardian->GetMaxHealth() + hpDelta);
-                    guardian->SetHealth(guardian->GetHealth() + hpDelta);
+                    guardian->SetStatFlatModifier(UNIT_MOD_HEALTH, TOTAL_VALUE,
+                        static_cast<float>(newHP));
+                    guardian->UpdateMaxHealth();
+                    uint32 newMaxHP = guardian->GetMaxHealth();
+                    guardian->SetHealth(std::min(guardian->GetHealth() + hpDelta, newMaxHP));
                 }
                 uint32 newMana = GetBonusMana(s);
                 if (newMana > oldMana && guardian->getPowerType() == POWER_MANA)
                 {
                     uint32 manaDelta = newMana - oldMana;
-                    guardian->SetMaxPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA) + manaDelta);
-                    guardian->SetPower(POWER_MANA, guardian->GetPower(POWER_MANA) + static_cast<int32>(manaDelta));
+                    guardian->SetStatFlatModifier(UNIT_MOD_MANA, TOTAL_VALUE,
+                        static_cast<float>(newMana));
+                    guardian->UpdateMaxPower(POWER_MANA);
+                    uint32 newMaxMana = guardian->GetMaxPower(POWER_MANA);
+                    guardian->SetPower(POWER_MANA,
+                        std::min(guardian->GetPower(POWER_MANA) + manaDelta, newMaxMana));
                 }
                 uint32 armorDelta = s.bonusArmor - oldArmor;
                 if (armorDelta > 0)
