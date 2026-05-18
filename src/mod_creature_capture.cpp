@@ -2671,7 +2671,9 @@ static bool CanCaptureCreature(Player* player, Creature* target, std::string& er
         return false;
     }
 
-    if (target->IsInCombat() && target->GetVictim() != player)
+    // Skip the combat check for friendly targets — they never attack the player
+    // so GetVictim() != player would always be true for them.
+    if (!player->IsFriendlyTo(target) && target->IsInCombat() && target->GetVictim() != player)
     {
         error = "Creature is in combat with someone else.";
         return false;
@@ -4244,7 +4246,12 @@ public:
                     // Fall through to show gossip so they can release
                 }
             }
-            // If not capturable (own guardian, etc.), fall through to gossip
+            else if (data->FindSlotByGuid(target->GetGUID()) < 0)
+            {
+                // Not one of our own guardians — show why capture failed
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffff0000[Tesseract]|r Cannot capture: {}", error);
+            }
         }
 
         // Build multi-slot gossip menu
