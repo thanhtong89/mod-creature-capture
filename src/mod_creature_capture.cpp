@@ -853,7 +853,7 @@ public:
                         }
 
                         // Healer: heal out of combat if owner, pet, or any ally is hurt
-                        auto needsHealing = [](Unit* u) { return u && u->IsAlive() && u->GetHealthPct() < 80.0f; };
+                        auto needsHealing = [](Unit* u) { return u && u->IsAlive() && u->GetHealthPct() < 90.0f; };
                         bool shouldHeal = needsHealing(_owner) || needsHealing(me);
                         if (!shouldHeal && ownerPet)
                             shouldHeal = needsHealing(ownerPet);
@@ -869,7 +869,7 @@ public:
                             }
                         }
                         if (shouldHeal)
-                            DoCastHealingSpells();
+                            DoCastHealingSpells(true);
                     }
                     else if (_archetype == ARCHETYPE_TANK)
                     {
@@ -940,8 +940,8 @@ public:
                             }
                         }
 
-                        // DPS: heal self or guardians out of combat if anyone is hurt
-                        DoCastEmergencyHeals(80.0f);
+                        // DPS: heal self, owner, or guardians out of combat if anyone is hurt
+                        DoCastEmergencyHeals(90.0f, true);
                     }
                 }
             }
@@ -1499,19 +1499,23 @@ private:
         if (DoCastHealingSpells())
             return;
 
-        // Priority 2: Buff allies (owner + other guardians)
+        // Priority 2: Dispel debuffs from allies
+        if (DoCastDispelSpells())
+            return;
+
+        // Priority 3: Buff allies (owner + other guardians)
         if (DoCastAllyBuffs())
             return;
 
-        // Priority 3: Maintain self buffs
+        // Priority 4: Maintain self buffs
         if (DoCastSelfBuffs())
             return;
 
-        // Priority 4: Debuff current target
+        // Priority 5: Debuff current target
         if (DoCastDebuffSpells())
             return;
 
-        // Priority 5: Conservative attack — prefer ranged if available, else melee
+        // Priority 6: Conservative attack — prefer ranged if available, else melee
         if (_preferredRange > 5.0f && DoCastFreeOffensiveSpells(true))
             return;
 
@@ -1555,7 +1559,7 @@ private:
                 continue;
 
             me->CastSpell(target, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, false);
+            ApplySpellCooldown(spellId, spellInfo);
             break;
         }
     }
@@ -1604,7 +1608,7 @@ private:
                 continue;
 
             me->CastSpell(target, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, false);
+            ApplySpellCooldown(spellId, spellInfo);
             return true;
         }
 
@@ -1658,7 +1662,7 @@ private:
                 continue;
 
             me->CastSpell(target, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, false);
+            ApplySpellCooldown(spellId, spellInfo);
             return true;
         }
 
@@ -1666,8 +1670,8 @@ private:
     }
 
     // DPS emergency heals: cast healing spells on self or fellow guardians below threshold.
-    // Does not heal the owner — player is trusted to manage themselves.
-    bool DoCastEmergencyHeals(float threshold = 35.0f)
+    // Pass includeOwner=true (out-of-combat) to also heal the player.
+    bool DoCastEmergencyHeals(float threshold = 35.0f, bool includeOwner = false)
     {
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
@@ -1689,6 +1693,8 @@ private:
         Check(me);
         if (_owner)
         {
+            if (includeOwner)
+                Check(_owner);
             CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
             for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
             {
@@ -1729,123 +1735,190 @@ private:
                 continue;
 
             me->CastSpell(healTarget, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, true);
+            ApplySpellCooldown(spellId, spellInfo);
             return true;
         }
 
         return false;
     }
 
-    bool DoCastHealingSpells()
+    // Cast the best available healing spell on target.
+    // shieldsFirst: do a shield-only pass before the general heal pass (used for critical player).
+    bool TryCastHealSpellOn(Unit* target, bool shieldsFirst)
+    {
+        int numPasses = shieldsFirst ? 2 : 1;
+        for (int pass = 0; pass < numPasses; ++pass)
+        {
+            for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+            {
+                uint32 spellId = _spellSlots[i];
+                if (!spellId) continue;
+
+                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+                if (!spellInfo) continue;
+
+                bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+                bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+                bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
+                if (!isDirectHeal && !isHoT && !isShield)
+                    continue;
+
+                if (shieldsFirst && pass == 0 && !isShield) continue;
+                if (shieldsFirst && pass == 1 && isShield)  continue;
+
+                if (me->HasSpellCooldown(spellId))
+                    continue;
+
+                if ((isHoT || isShield) && target->HasAura(spellId, me->GetGUID()))
+                    continue;
+
+                float maxRange = spellInfo->GetMaxRange(true);
+                if (maxRange > 0.0f && !me->IsWithinDist(target, maxRange))
+                    continue;
+                if (!me->IsWithinLOSInMap(target))
+                    continue;
+
+                me->CastSpell(target, spellId, false);
+                ApplySpellCooldown(spellId, spellInfo);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // outOfCombat: phase-3 threshold widens from 50% to 90%.
+    bool DoCastHealingSpells(bool outOfCombat = false)
     {
         if (me->HasUnitState(UNIT_STATE_CASTING))
             return false;
 
-        Unit* healTarget = nullptr;
-
-        // Phase 1: anyone critically low (< 25%) — pick lowest HP across all allies
+        // Phase 1: player critically low (< 25%) — shields first, then heals
+        if (_owner && _owner->IsAlive() && _owner->GetHealthPct() < 25.0f)
         {
-            float lowestCritical = 25.0f;
+            if (TryCastHealSpellOn(_owner, /*shieldsFirst=*/true))
+                return true;
+        }
 
-            auto CheckCritical = [&](Unit* u)
+        // Phase 2: tank guardians below 70%
+        if (_owner)
+        {
+            Unit* tankTarget  = nullptr;
+            float lowestTank  = 70.0f;
+            CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+            for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
             {
-                if (!u || !u->IsAlive())
-                    return;
+                GuardianSlotData& s = data->slots[i];
+                if (!s.IsActive() || s.archetype != ARCHETYPE_TANK)
+                    continue;
+                Creature* ally = ObjectAccessor::GetCreature(*me, s.guardianGuid);
+                if (!ally || !ally->IsAlive()) continue;
+                float pct = ally->GetHealthPct();
+                if (pct < lowestTank) { lowestTank = pct; tankTarget = ally; }
+            }
+            if (tankTarget && TryCastHealSpellOn(tankTarget, false))
+                return true;
+        }
+
+        // Phase 3: everyone else — 50% in combat, 90% out of combat
+        {
+            float threshold = outOfCombat ? 90.0f : 50.0f;
+            Unit* healTarget = nullptr;
+            float lowestPct  = threshold;
+
+            auto Check = [&](Unit* u)
+            {
+                if (!u || !u->IsAlive()) return;
                 float pct = u->GetHealthPct();
-                if (pct < lowestCritical)
-                {
-                    lowestCritical = pct;
-                    healTarget = u;
-                }
+                if (pct < lowestPct) { lowestPct = pct; healTarget = u; }
             };
 
-            CheckCritical(me);
+            Check(me);
             if (_owner)
             {
-                CheckCritical(_owner);
-                CheckCritical(_owner->GetPet());
+                Check(_owner);
+                Check(_owner->GetPet());
                 CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
                 for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
                 {
                     GuardianSlotData& s = data->slots[i];
-                    if (!s.IsActive() || s.guardianGuid == me->GetGUID())
-                        continue;
-                    CheckCritical(ObjectAccessor::GetCreature(*me, s.guardianGuid));
+                    if (!s.IsActive() || s.guardianGuid == me->GetGUID()) continue;
+                    Check(ObjectAccessor::GetCreature(*me, s.guardianGuid));
                 }
             }
+
+            if (healTarget)
+                return TryCastHealSpellOn(healTarget, false);
         }
 
-        // Phase 2: standard 50% threshold — pick lowest HP% across all allies
-        if (!healTarget)
-        {
-            float lowestStandard = 50.0f;
+        return false;
+    }
 
-            auto CheckStandard = [&](Unit* u)
-            {
-                if (!u || !u->IsAlive())
-                    return;
-                float pct = u->GetHealthPct();
-                if (pct < lowestStandard)
-                {
-                    lowestStandard = pct;
-                    healTarget = u;
-                }
-            };
-
-            CheckStandard(me);
-            if (_owner)
-            {
-                CheckStandard(_owner);
-                CheckStandard(_owner->GetPet());
-                CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-                for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
-                {
-                    GuardianSlotData& s = data->slots[i];
-                    if (!s.IsActive() || s.guardianGuid == me->GetGUID())
-                        continue;
-                    CheckStandard(ObjectAccessor::GetCreature(*me, s.guardianGuid));
-                }
-            }
-        }
-
-        if (!healTarget)
+    bool DoCastDispelSpells()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING) || !_owner)
             return false;
 
         for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
         {
             uint32 spellId = _spellSlots[i];
-            if (!spellId)
-                continue;
+            if (!spellId) continue;
 
             SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
-            if (!spellInfo)
-                continue;
+            if (!spellInfo || !spellInfo->IsPositive()) continue;
+            if (me->HasSpellCooldown(spellId)) continue;
 
-            bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
-            bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
-            bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
-            if (!isDirectHeal && !isHoT && !isShield)
-                continue;
+            // Identify SPELL_EFFECT_DISPEL and its type
+            uint32 dispelType = DISPEL_NONE;
+            for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
+            {
+                if (spellInfo->Effects[eff].Effect == SPELL_EFFECT_DISPEL)
+                {
+                    dispelType = spellInfo->Effects[eff].MiscValue;
+                    break;
+                }
+            }
+            if (dispelType == DISPEL_NONE) continue;
 
-            if (me->HasSpellCooldown(spellId))
-                continue;
+            uint32 dispelMask = SpellInfo::GetDispelMask(DispelType(dispelType));
 
-            // Don't reapply HoTs or shields already active on the target
-            if ((isHoT || isShield) && healTarget->HasAura(spellId, me->GetGUID()))
-                continue;
+            // Priority: owner > pet > fellow guardians > self
+            Unit* dispelTarget = nullptr;
 
-            // Skip if target is out of range or line of sight
+            auto TryTarget = [&](Unit* u)
+            {
+                if (dispelTarget || !u || !u->IsAlive()) return;
+                DispelChargesList list;
+                u->GetDispellableAuraList(me, dispelMask, list, spellInfo);
+                if (!list.empty())
+                    dispelTarget = u;
+            };
+
+            TryTarget(_owner);
+            if (!dispelTarget)
+            {
+                TryTarget(_owner->GetPet());
+                CapturedGuardianData* data = _owner->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+                for (uint8 j = 0; j < MAX_GUARDIAN_SLOTS && !dispelTarget; ++j)
+                {
+                    GuardianSlotData& s = data->slots[j];
+                    if (!s.IsActive()) continue;
+                    TryTarget(ObjectAccessor::GetCreature(*me, s.guardianGuid));
+                }
+                TryTarget(me);
+            }
+
+            if (!dispelTarget) continue;
+
             float maxRange = spellInfo->GetMaxRange(true);
-            if (maxRange > 0.0f && !me->IsWithinDist(healTarget, maxRange))
+            if (maxRange > 0.0f && !me->IsWithinDist(dispelTarget, maxRange))
                 continue;
-            if (!me->IsWithinLOSInMap(healTarget))
+            if (!me->IsWithinLOSInMap(dispelTarget))
                 continue;
 
-            me->CastSpell(healTarget, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, true);
+            me->CastSpell(dispelTarget, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo);
             return true;
         }
-
         return false;
     }
 
@@ -1877,7 +1950,7 @@ private:
                 continue;
 
             me->CastSpell(me, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, false);
+            ApplySpellCooldown(spellId, spellInfo);
             cast = true;
             break;
         }
@@ -1944,7 +2017,7 @@ private:
                     continue;
 
                 me->CastSpell(ally, spellId, false);
-                ApplySpellCooldown(spellId, spellInfo, false);
+                ApplySpellCooldown(spellId, spellInfo);
                 return true;
             }
         }
@@ -2001,29 +2074,23 @@ private:
                 continue;
 
             me->CastSpell(target, spellId, false);
-            ApplySpellCooldown(spellId, spellInfo, false);
+            ApplySpellCooldown(spellId, spellInfo);
             return true;
         }
         return false;
     }
 
-    void ApplySpellCooldown(uint32 spellId, SpellInfo const* spellInfo, bool isHeal)
+    void ApplySpellCooldown(uint32 spellId, SpellInfo const* spellInfo)
     {
         uint32 cooldown = spellInfo->RecoveryTime;
+        if (spellInfo->CategoryRecoveryTime > cooldown)
+            cooldown = spellInfo->CategoryRecoveryTime;
+        if (spellInfo->StartRecoveryTime > cooldown)
+            cooldown = spellInfo->StartRecoveryTime;
+        if (cooldown == 0)
+            cooldown = 2000;
 
-        if (isHeal && cooldown < 10000)
-            cooldown = 10000;
-        else
-        {
-            if (spellInfo->CategoryRecoveryTime > cooldown)
-                cooldown = spellInfo->CategoryRecoveryTime;
-            if (spellInfo->StartRecoveryTime > cooldown)
-                cooldown = spellInfo->StartRecoveryTime;
-            if (cooldown == 0)
-                cooldown = 2000;
-
-            cooldown += urand(500, 1500);
-        }
+        cooldown += urand(500, 1500);
 
         if (cooldown > 0)
             me->AddSpellCooldown(spellId, 0, cooldown);
