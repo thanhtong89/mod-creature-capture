@@ -1150,6 +1150,21 @@ private:
                spellInfo->DmgClass != SPELL_DAMAGE_CLASS_MELEE;
     }
 
+    static bool IsCCSpell(SpellInfo const* spellInfo)
+    {
+        for (uint8 eff = 0; eff < MAX_SPELL_EFFECTS; ++eff)
+        {
+            if (spellInfo->Effects[eff].Effect == SPELL_EFFECT_INTERRUPT_CAST)
+                return true;
+            AuraType aura = AuraType(spellInfo->Effects[eff].ApplyAuraName);
+            if (aura == SPELL_AURA_MOD_STUN ||
+                aura == SPELL_AURA_MOD_FEAR ||
+                aura == SPELL_AURA_MOD_CONFUSE)
+                return true;
+        }
+        return false;
+    }
+
     // Recalculate preferred ranged distance from taught spells.
     // Used by ranged DPS stance and healers (healers always prefer range).
     void RecalcPreferredRange()
@@ -1334,10 +1349,13 @@ private:
         if (DoCastSelfBuffs())
             return;
 
-        // Priority 4: Debuffs on current target
+        // Priority 4: CC spells (interrupt/stun priority casters, then any caster, else skip if long CD)
+        if (DoCastCCSpells()) return;
+
+        // Priority 5: Debuffs on current target
         DoCastDebuffSpells();
 
-        // Priority 5: Offensive damage spells
+        // Priority 6: Offensive damage spells
         DoCastOffensiveSpells();
     }
 
@@ -1408,19 +1426,23 @@ private:
         if (DoCastEmergencyHeals())
             return;
 
-        // Priority 2: Ranged offensive spells
+        // Priority 2: CC spells (interrupt/stun priority casters, then any caster, else skip if long CD)
+        if (DoCastCCSpells())
+            return;
+
+        // Priority 3: Ranged offensive spells
         if (DoCastRangedOffensiveSpells())
             return;
 
-        // Priority 3: Buff allies
+        // Priority 4: Buff allies
         if (DoCastAllyBuffs())
             return;
 
-        // Priority 4: Self buffs
+        // Priority 5: Self buffs
         if (DoCastSelfBuffs())
             return;
 
-        // Priority 5: Debuffs on current target
+        // Priority 6: Debuffs on current target
         DoCastDebuffSpells();
 
         // Fallback: melee if enemy is close
@@ -1490,6 +1512,7 @@ private:
         }
 
         DoCastSelfBuffs();
+        if (DoCastCCSpells()) return;
         DoCastOffensiveSpells();
     }
 
@@ -1545,6 +1568,9 @@ private:
             if (spellInfo->IsPositive())
                 continue;
 
+            if (IsCCSpell(spellInfo))
+                continue;
+
             if (me->HasSpellCooldown(spellId))
                 continue;
 
@@ -1584,6 +1610,9 @@ private:
                 continue;
 
             if (spellInfo->IsPositive())
+                continue;
+
+            if (IsCCSpell(spellInfo))
                 continue;
 
             // Only cast ranged spells in this pass
@@ -1635,6 +1664,9 @@ private:
                 continue;
 
             if (spellInfo->IsPositive())
+                continue;
+
+            if (IsCCSpell(spellInfo))
                 continue;
 
             if (!IsFreeCostSpell(spellInfo))
@@ -2024,6 +2056,99 @@ private:
         return false;
     }
 
+    // Returns the first hostile unit in the threat list that is actively casting.
+    // ccCastersOnly=true  → only units casting a stun/fear/confuse/interrupt spell.
+    // ccCastersOnly=false → any unit casting a non-melee spell (interruptible).
+    Unit* FindCastingEnemy(float maxRange, bool ccCastersOnly)
+    {
+        auto IsCastingCC = [](Unit* u) -> bool
+        {
+            for (int t = CURRENT_GENERIC_SPELL; t <= CURRENT_CHANNELED_SPELL; ++t)
+            {
+                Spell* sp = u->GetCurrentSpell(CurrentSpellTypes(t));
+                if (!sp) continue;
+                SpellInfo const* si = sp->GetSpellInfo();
+                if (si && !si->IsPositive() && IsCCSpell(si))
+                    return true;
+            }
+            return false;
+        };
+
+        for (auto const& ref : me->GetThreatMgr().GetThreatList())
+        {
+            Unit* enemy = ref->getTarget();
+            if (!enemy || !enemy->IsAlive())
+                continue;
+            if (maxRange > 0.0f && !me->IsWithinDist(enemy, maxRange))
+                continue;
+            if (!me->IsValidAttackTarget(enemy))
+                continue;
+
+            if (ccCastersOnly)
+            {
+                if (IsCastingCC(enemy))
+                    return enemy;
+            }
+            else
+            {
+                if (enemy->IsNonMeleeSpellCast(false))
+                    return enemy;
+            }
+        }
+        return nullptr;
+    }
+
+    bool DoCastCCSpells()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING))
+            return false;
+
+        Unit* victim = me->GetVictim();
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId) continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo || spellInfo->IsPositive()) continue;
+            if (me->HasSpellCooldown(spellId)) continue;
+            if (!IsCCSpell(spellInfo)) continue;
+
+            float maxRange = spellInfo->GetMaxRange(false);
+
+            // Priority 1: enemy actively casting a CC spell (counter their CC)
+            Unit* ccTarget = FindCastingEnemy(maxRange, /*ccCastersOnly=*/true);
+
+            // Priority 2: any enemy casting an interruptible spell
+            if (!ccTarget)
+                ccTarget = FindCastingEnemy(maxRange, /*ccCastersOnly=*/false);
+
+            // Priority 3: no casting targets — only use if cooldown is short (≤ 10s)
+            if (!ccTarget)
+            {
+                uint32 cd = std::max({spellInfo->RecoveryTime,
+                                      spellInfo->CategoryRecoveryTime,
+                                      spellInfo->StartRecoveryTime});
+                if (cd > 10000)
+                    continue;
+                ccTarget = victim;
+            }
+
+            if (!ccTarget) continue;
+
+            if (maxRange > 0.0f && !me->IsWithinDist(ccTarget, maxRange))
+                continue;
+            if (!me->IsWithinLOSInMap(ccTarget))
+                continue;
+
+            me->CastSpell(ccTarget, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo);
+            return true;
+        }
+        return false;
+    }
+
     bool DoCastDebuffSpells()
     {
         if (me->HasUnitState(UNIT_STATE_CASTING))
@@ -2041,6 +2166,10 @@ private:
 
             SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
             if (!spellInfo || spellInfo->IsPositive())
+                continue;
+
+            // CC spells are handled exclusively by DoCastCCSpells
+            if (IsCCSpell(spellInfo))
                 continue;
 
             // Skip direct damage spells — those are handled by DoCastOffensiveSpells
