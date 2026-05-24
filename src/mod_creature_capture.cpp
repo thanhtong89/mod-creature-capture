@@ -871,6 +871,9 @@ public:
                         }
                         if (shouldHeal)
                             DoCastHealingSpells(true);
+
+                        // Also heal a friendly injured NPC the player has targeted (lowest priority)
+                        DoCastTargetedNPCHeal();
                     }
                     else if (_archetype == ARCHETYPE_TANK)
                     {
@@ -1139,6 +1142,21 @@ private:
         return spellInfo->ManaCost == 0 &&
                spellInfo->ManaCostPercentage == 0 &&
                spellInfo->ManaCostPerlevel == 0;
+    }
+
+    // Returns true for any spell whose primary purpose is restoring health.
+    // Covers HEAL (direct), HEAL_PCT (% max HP), HEAL_MAX_HEALTH (full restore),
+    // and PERIODIC_HEAL auras (HoTs). Used to detect heals and exclude them
+    // from buff/debuff paths.
+    bool IsHealingSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo)
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+               spellInfo->HasEffect(SPELL_EFFECT_HEAL_PCT) ||
+               spellInfo->HasEffect(SPELL_EFFECT_HEAL_MAX_HEALTH) ||
+               spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
     }
 
     // Check if a spell is ranged (max range > 5 yards, non-melee)
@@ -1545,6 +1563,76 @@ private:
 
         DoMeleeAttackIfReady();
         DoCastFreeOffensiveSpells();
+
+        // Priority 7: Heal player-targeted friendly injured NPC (lowest priority)
+        DoCastTargetedNPCHeal();
+    }
+
+    // Lowest-priority healer action: heal a friendly injured NPC the player has targeted.
+    // Only triggers when no higher-priority heal target exists and the player's selection
+    // is a non-guardian creature that is friendly and below full HP.
+    bool DoCastTargetedNPCHeal()
+    {
+        if (me->HasUnitState(UNIT_STATE_CASTING) || !_owner)
+            return false;
+
+        Unit* selected = _owner->GetSelectedUnit();
+        if (!selected || !selected->IsAlive())
+            return false;
+
+        // Must be a creature, not a player
+        Creature* npc = selected->ToCreature();
+        if (!npc)
+            return false;
+
+        // Skip captured guardians — already handled by DoCastHealingSpells
+        if (npc->GetOwnerGUID() == _owner->GetGUID())
+            return false;
+
+        // Must be friendly and actually injured — check from owner's perspective,
+        // since the guardian's faction may differ from the player's
+        if (!_owner->IsFriendlyTo(npc))
+            return false;
+
+        if (npc->IsFullHealth())
+            return false;
+
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        {
+            uint32 spellId = _spellSlots[i];
+            if (!spellId) continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!spellInfo) continue;
+
+            bool isDirectHeal = spellInfo->IsPositive() && (
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL_PCT) ||
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL_MAX_HEALTH));
+            bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+            bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
+            if (!isDirectHeal && !isHoT && !isShield)
+                continue;
+
+            if (me->HasSpellCooldown(spellId))
+                continue;
+
+            if ((isHoT || isShield) && npc->HasAura(spellId, me->GetGUID()))
+                continue;
+
+            float maxRange = spellInfo->GetMaxRange(true);
+            if (maxRange > 0.0f && !me->IsWithinDist(npc, maxRange))
+                continue;
+
+            if (!me->IsWithinLOSInMap(npc))
+                continue;
+
+            me->CastSpell(npc, spellId, false);
+            ApplySpellCooldown(spellId, spellInfo);
+            return true;
+        }
+
+        return false;
     }
 
     void DoCastOffensiveSpells()
@@ -1749,7 +1837,10 @@ private:
             SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
             if (!spellInfo) continue;
 
-            bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+            bool isDirectHeal = spellInfo->IsPositive() && (
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL_PCT) ||
+                spellInfo->HasEffect(SPELL_EFFECT_HEAL_MAX_HEALTH));
             bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
             bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
             if (!isDirectHeal && !isHoT && !isShield)
@@ -1790,7 +1881,10 @@ private:
                 SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
                 if (!spellInfo) continue;
 
-                bool isDirectHeal = spellInfo->IsPositive() && spellInfo->HasEffect(SPELL_EFFECT_HEAL);
+                bool isDirectHeal = spellInfo->IsPositive() && (
+                    spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
+                    spellInfo->HasEffect(SPELL_EFFECT_HEAL_PCT) ||
+                    spellInfo->HasEffect(SPELL_EFFECT_HEAL_MAX_HEALTH));
                 bool isHoT        = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
                 bool isShield     = spellInfo->IsPositive() && spellInfo->HasAura(SPELL_AURA_SCHOOL_ABSORB);
                 if (!isDirectHeal && !isHoT && !isShield)
@@ -1971,9 +2065,7 @@ private:
             if (!spellInfo)
                 continue;
 
-            bool isHeal = spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
-                          spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
-            if (!spellInfo->IsPositive() || isHeal)
+            if (!spellInfo->IsPositive() || IsHealingSpell(spellInfo))
                 continue;
 
             if (me->HasAura(spellId))
@@ -2022,9 +2114,8 @@ private:
             if (!spellInfo || !spellInfo->IsPositive())
                 continue;
 
-            // Skip heals and HoTs — those are handled by DoCastHealingSpells
-            if (spellInfo->HasEffect(SPELL_EFFECT_HEAL) ||
-                spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL))
+            // Skip heals — those are handled by DoCastHealingSpells
+            if (IsHealingSpell(spellInfo))
                 continue;
 
             // Must have an aura component to be a buff
