@@ -3019,9 +3019,20 @@ static TempSummon* SummonCapturedGuardian(Player* player, uint32 entry, uint8 le
         guardian->setPowerType(pType);
         uint32 maxPower = CalculateMaxPower(pType, level);
         if (pType == POWER_MANA)
+        {
             guardian->SetCreateMana(CalculateBaseMana(level));
-        guardian->SetMaxPower(pType, maxPower);
-        guardian->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
+            // Creature::UpdateMaxPower uses GetTotalAuraModValue (BASE_VALUE*BASE_PCT +
+            // TOTAL_VALUE*TOTAL_PCT) and does not add GetCreateMana(). Store the base max
+            // in BASE_VALUE so subsequent UpdateMaxPower calls (e.g. bonus mana) include it.
+            guardian->SetStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, static_cast<float>(maxPower));
+            guardian->UpdateMaxPower(POWER_MANA);
+            guardian->SetPower(POWER_MANA, guardian->GetMaxPower(POWER_MANA));
+        }
+        else
+        {
+            guardian->SetMaxPower(pType, maxPower);
+            guardian->SetPower(pType, pType == POWER_RAGE ? 0 : maxPower);
+        }
     }
 
     if (displayId != 0)
@@ -4395,8 +4406,13 @@ public:
                         Powers pType = Powers(s.guardianPowerType);
                         uint32 maxPower = CalculateMaxPower(pType, newLevel);
                         if (pType == POWER_MANA)
+                        {
                             guardian->SetCreateMana(CalculateBaseMana(newLevel));
-                        guardian->SetMaxPower(pType, maxPower);
+                            guardian->SetStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, static_cast<float>(maxPower));
+                            guardian->UpdateMaxPower(POWER_MANA);
+                        }
+                        else
+                            guardian->SetMaxPower(pType, maxPower);
                     }
                 }
             }
@@ -4977,9 +4993,17 @@ public:
             creature->setPowerType(pType);
             uint32 maxPower = CalculateMaxPower(pType, s.guardianLevel);
             if (pType == POWER_MANA)
+            {
                 creature->SetCreateMana(CalculateBaseMana(s.guardianLevel));
-            creature->SetMaxPower(pType, maxPower);
-            creature->SetPower(pType, (pType == POWER_RAGE) ? 0 : maxPower);
+                creature->SetStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, static_cast<float>(maxPower));
+                creature->UpdateMaxPower(POWER_MANA);
+                creature->SetPower(POWER_MANA, creature->GetMaxPower(POWER_MANA));
+            }
+            else
+            {
+                creature->SetMaxPower(pType, maxPower);
+                creature->SetPower(pType, pType == POWER_RAGE ? 0 : maxPower);
+            }
 
             SaveGuardianSlotToDb(player, &s, slot);
             SendGuardianPower(player, slot, newPowerType);
