@@ -25,6 +25,8 @@
 #include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellMgr.h"
+#include "SpellScript.h"
+#include "SpellScriptLoader.h"
 #include "TemporarySummon.h"
 #include "Unit.h"
 #include "WorldPacket.h"
@@ -409,7 +411,7 @@ struct GuardianSlotData
 
     bool HasPreservedProgress() const
     {
-        for (int i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
+        for (uint32 i = 0; i < MAX_GUARDIAN_SPELLS; ++i)
             if (spellSlots[i] != 0)
                 return true;
         return bonusStrength != 0 || bonusAgility != 0 || bonusIntellect != 0 || bonusStamina != 0
@@ -430,6 +432,9 @@ class CapturedGuardianData : public DataMap::Base
 {
 public:
     GuardianSlotData slots[MAX_GUARDIAN_SLOTS];
+
+    ObjectGuid pendingCaptureTarget;
+    uint8      pendingCaptureSlot = 0;
 
     int8 FindEmptySlot() const
     {
@@ -3487,6 +3492,84 @@ static int8 FindTargetedGuardianSlot(Player* player, CapturedGuardianData* data)
 }
 
 // ============================================================================
+// Shared capture completion logic (called from AuraScript on channel expire)
+// ============================================================================
+
+static void DoCapture(Player* player, Creature* target, uint8 slotIndex)
+{
+    uint32 entry               = target->GetEntry();
+    uint8  level               = player->GetLevel();
+    std::string name           = target->GetName();
+    uint32 capturedDisplayId   = target->GetDisplayId();
+    int8   capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
+    uint8  capturedPowerType   = target->getPowerType();
+
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    GuardianSlotData& s = data->slots[slotIndex];
+    uint32 spells[MAX_GUARDIAN_SPELLS];
+    if (s.HasPreservedProgress())
+        memcpy(spells, s.spellSlots, sizeof(spells));
+    else
+        PopulateDefaultSpells(entry, spells, target);
+
+    target->DespawnOrUnsummon();
+
+    TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
+        slotIndex, capturedDisplayId, capturedEquipmentId, capturedPowerType);
+    if (!guardian)
+    {
+        ChatHandler(player->GetSession()).PSendSysMessage("|cffff0000[Capture]|r Failed to summon guardian.");
+        return;
+    }
+
+    s.guardianGuid      = guardian->GetGUID();
+    s.guardianEntry     = entry;
+    s.guardianLevel     = level;
+    s.guardianHealth    = guardian->GetHealth();
+    s.guardianPowerType = guardian->getPowerType();
+    s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
+    s.archetype         = ARCHETYPE_DPS;
+    s.displayId         = capturedDisplayId;
+    s.equipmentId       = capturedEquipmentId;
+    if (!s.HasPreservedProgress())
+        memcpy(s.spellSlots, spells, sizeof(spells));
+
+    SaveGuardianSlotToDb(player, &s, slotIndex);
+    ChatHandler(player->GetSession()).PSendSysMessage(
+        "|cff00ff00[Capture]|r {} captured in slot {}!", name, slotIndex + 1);
+    SendFullSlotState(player, slotIndex, s);
+}
+
+// ============================================================================
+// Shared channel initiation (used by both .capture command and Tesseract)
+// ============================================================================
+
+static bool StartCaptureChannel(Player* player, Creature* target, uint8 slotIndex,
+    std::function<void(std::string const&)> sendMsg)
+{
+    CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+    data->pendingCaptureTarget = target->GetGUID();
+    data->pendingCaptureSlot   = slotIndex;
+
+    target->SetReactState(REACT_AGGRESSIVE);
+    target->AddThreat(player, 9999.0f);
+    target->AI()->AttackStart(player);
+
+    Aura* channelAura = player->AddAura(1515, target);
+    if (!channelAura)
+    {
+        data->pendingCaptureTarget = ObjectGuid::Empty;
+        sendMsg("Failed to start capture channel.");
+        return false;
+    }
+    channelAura->SetDuration(10000);
+    channelAura->SetMaxDuration(10000);
+
+    sendMsg("|cff00ff00[Capture]|r Channeling — survive 10 seconds!");
+    return true;
+}
+
+// ============================================================================
 // Command Script
 // ============================================================================
 
@@ -3501,15 +3584,15 @@ public:
     {
         static ChatCommandTable captureCommandTable =
         {
-            { "",           HandleCaptureCommand,    SEC_PLAYER,        Console::No },
-            { "dismiss",    HandleDismissCommand,    SEC_PLAYER,        Console::No },
-            { "info",       HandleInfoCommand,       SEC_PLAYER,        Console::No },
-            { "spawn",      HandleSpawnCommand,      SEC_GAMEMASTER,    Console::No },
-            { "teach",      HandleTeachCommand,      SEC_PLAYER,        Console::No },
-            { "unlearn",    HandleUnlearnCommand,    SEC_PLAYER,        Console::No },
-            { "swap",       HandleSwapCommand,       SEC_PLAYER,        Console::No },
-            { "feed",       HandleFeedCommand,       SEC_PLAYER,        Console::No },
-            { "feedpreview", HandleFeedPreviewCommand, SEC_PLAYER,       Console::No },
+            { "",           HandleCaptureCommand,        SEC_PLAYER,        Console::No },
+            { "dismiss",    HandleDismissCommand,        SEC_PLAYER,        Console::No },
+            { "info",       HandleInfoCommand,           SEC_PLAYER,        Console::No },
+            { "spawn",      HandleSpawnCommand,          SEC_GAMEMASTER,    Console::No },
+            { "teach",      HandleTeachCommand,          SEC_PLAYER,        Console::No },
+            { "unlearn",    HandleUnlearnCommand,        SEC_PLAYER,        Console::No },
+            { "swap",       HandleSwapCommand,           SEC_PLAYER,        Console::No },
+            { "feed",       HandleFeedCommand,           SEC_PLAYER,        Console::No },
+            { "feedpreview", HandleFeedPreviewCommand,   SEC_PLAYER,        Console::No },
         };
 
         static ChatCommandTable commandTable =
@@ -3549,50 +3632,8 @@ public:
             return true;
         }
 
-        uint32 entry = target->GetEntry();
-        uint8 level = player->GetLevel();
-        std::string name = target->GetName();
-        uint32 capturedDisplayId = target->GetDisplayId();
-        int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
-        uint8 capturedPowerType = target->getPowerType();
-
-        // If the slot has preserved progress, carry its spells forward; otherwise seed from creature defaults.
-        GuardianSlotData& s = data->slots[emptySlot];
-        uint32 spells[MAX_GUARDIAN_SPELLS];
-        if (s.HasPreservedProgress())
-            memcpy(spells, s.spellSlots, sizeof(spells));
-        else
-            PopulateDefaultSpells(entry, spells, target);
-
-        target->DespawnOrUnsummon();
-
-        TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
-            static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId, capturedPowerType);
-        if (!guardian)
-        {
-            handler->PSendSysMessage("Failed to summon guardian.");
-            return true;
-        }
-
-        s.guardianGuid      = guardian->GetGUID();
-        s.guardianEntry     = entry;
-        s.guardianLevel     = level;
-        s.guardianHealth    = guardian->GetHealth();
-        s.guardianPowerType = guardian->getPowerType();
-        s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
-        s.archetype         = ARCHETYPE_DPS;
-        s.displayId         = capturedDisplayId;
-        s.equipmentId       = capturedEquipmentId;
-        // spellSlots already set (either preserved or fresh defaults via SummonCapturedGuardian)
-        if (!s.HasPreservedProgress())
-            memcpy(s.spellSlots, spells, sizeof(spells));
-
-        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
-
-        handler->PSendSysMessage("You have captured {} (Level {}) in slot {}!", name, level, emptySlot + 1);
-
-        SendFullSlotState(player, static_cast<uint8>(emptySlot), s);
-
+        StartCaptureChannel(player, target, static_cast<uint8>(emptySlot),
+            [&](std::string const& msg) { handler->PSendSysMessage("{}", msg); });
         return true;
     }
 
@@ -4423,8 +4464,6 @@ public:
 
     void OnPlayerMapChanged(Player* player) override
     {
-        CapturedGuardianData* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
-
         // Re-summon guardians that were temporarily despawned for map change
         for (uint8 i = 0; i < MAX_GUARDIAN_SLOTS; ++i)
             SummonGuardianSlot(player, i, false);
@@ -4480,50 +4519,11 @@ public:
                 int8 emptySlot = data->FindEmptySlot();
                 if (emptySlot >= 0)
                 {
-                    // Auto-capture into first empty slot
-                    uint32 entry = target->GetEntry();
-                    uint8 level = player->GetLevel();
-                    uint32 capturedDisplayId = target->GetDisplayId();
-                    int8 capturedEquipmentId = static_cast<int8>(target->GetCurrentEquipmentId());
-                    uint8 capturedPowerType = target->getPowerType();
-
-                    GuardianSlotData& s = data->slots[emptySlot];
-                    uint32 spells[MAX_GUARDIAN_SPELLS];
-                    if (s.HasPreservedProgress())
-                        memcpy(spells, s.spellSlots, sizeof(spells));
-                    else
-                        PopulateDefaultSpells(entry, spells, target);
-
-                    target->DespawnOrUnsummon();
-
-                    TempSummon* guardian = SummonCapturedGuardian(player, entry, level, ARCHETYPE_DPS, spells,
-                        static_cast<uint8>(emptySlot), capturedDisplayId, capturedEquipmentId, capturedPowerType);
-                    if (guardian)
-                    {
-                        s.guardianGuid      = guardian->GetGUID();
-                        s.guardianEntry     = entry;
-                        s.guardianLevel     = level;
-                        s.guardianHealth    = guardian->GetHealth();
-                        s.guardianPowerType = guardian->getPowerType();
-                        s.guardianPower     = guardian->GetPower(Powers(s.guardianPowerType));
-                        s.archetype         = ARCHETYPE_DPS;
-                        s.displayId         = capturedDisplayId;
-                        s.equipmentId       = capturedEquipmentId;
-                        if (!s.HasPreservedProgress())
-                            memcpy(s.spellSlots, spells, sizeof(spells));
-
-                        SaveGuardianSlotToDb(player, &s, static_cast<uint8>(emptySlot));
-
-                        ChatHandler(player->GetSession()).PSendSysMessage(
-                            "|cff00ff00[Tesseract]|r {} captured in slot {}!", guardian->GetName(), emptySlot + 1);
-
-                        SendFullSlotState(player, static_cast<uint8>(emptySlot), s);
-                    }
-                    else
-                    {
-                        ChatHandler(player->GetSession()).PSendSysMessage(
-                            "|cffff0000[Tesseract]|r Failed to capture creature.");
-                    }
+                    StartCaptureChannel(player, target, static_cast<uint8>(emptySlot),
+                        [&](std::string const& msg)
+                        {
+                            ChatHandler(player->GetSession()).PSendSysMessage("{}", msg);
+                        });
                     return true;
                 }
                 else
@@ -5195,6 +5195,61 @@ public:
 };
 
 // ============================================================================
+// Tame Beast aura (spell 1515) applied directly to the capture target via
+// AddAura. AURA_REMOVE_BY_EXPIRE = player survived 10 seconds → capture.
+// Anything else (caster died, creature evaded) → failure.
+// ============================================================================
+
+class spell_creature_capture_channel : public AuraScript
+{
+    PrepareAuraScript(spell_creature_capture_channel);
+
+    void OnApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+    {
+        Unit* caster = GetCaster();
+        if (!caster || !caster->IsPlayer())
+            return;
+        ChatHandler(caster->ToPlayer()->GetSession()).PSendSysMessage(
+            "|cff00ff00[Capture]|r Channeling — survive 10 seconds!");
+    }
+
+    void OnRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+    {
+        Unit* caster = GetCaster();
+        if (!caster || !caster->IsPlayer())
+            return;
+
+        Player* player = caster->ToPlayer();
+        auto* data = player->CustomData.GetDefault<CapturedGuardianData>("CapturedGuardian");
+
+        uint8 slot = data->pendingCaptureSlot;
+        data->pendingCaptureTarget = ObjectGuid::Empty;
+        data->pendingCaptureSlot   = 0;
+
+        Creature* target = GetTarget()->ToCreature();
+
+        if (GetTargetApplication()->GetRemoveMode() == AURA_REMOVE_BY_EXPIRE)
+        {
+            if (target)
+                DoCapture(player, target, slot);
+        }
+        else
+        {
+            if (target)
+                target->AI()->EnterEvadeMode();
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "|cffff0000[Capture]|r Capture failed!");
+        }
+    }
+
+    void Register() override
+    {
+        OnEffectApply     += AuraEffectApplyFn (spell_creature_capture_channel::OnApply,  EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+        AfterEffectRemove += AuraEffectRemoveFn(spell_creature_capture_channel::OnRemove, EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+    }
+};
+
+// ============================================================================
 // Registration
 // ============================================================================
 
@@ -5206,4 +5261,5 @@ void AddSC_mod_creature_capture()
     new TesseractItemScript();
     new CaptureGuardianGossipScript();
     new CaptureGuardianUnitScript();
+    RegisterSpellScript(spell_creature_capture_channel);
 }
