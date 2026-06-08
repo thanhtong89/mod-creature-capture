@@ -717,9 +717,10 @@ public:
                 // enemies, UpdateVictim() re-engages immediately with no gap.
                 if (UpdateVictim())
                     return;
-                // No threat table entries; reset the combat check timer so the
-                // owner-target scan fires on the very next tick instead of waiting.
+                // No threat table entries — fully leave combat so the player
+                // is not held in combat by this guardian's lingering flag.
                 _combatCheckTimer = 0;
+                me->CombatStop(true);
                 me->GetMotionMaster()->Clear();
                 if (_owner)
                     me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
@@ -1033,12 +1034,6 @@ public:
         if (_archetype == ARCHETYPE_HEALER && !HasEstablishedTank(target))
             return;
 
-        if (!me->IsInCombat())
-        {
-            me->SetInCombatWith(target);
-            target->SetInCombatWith(me);
-        }
-
         if (me->Attack(target, true))
         {
             // Ranged DPS and healers with ranged spells keep their distance
@@ -1059,7 +1054,9 @@ public:
         if (me->GetVictim() && me->GetVictim()->IsAlive())
             return;
 
-        me->AttackStop();
+        // CombatStop(true) clears the combat flag and threat list; AttackStop() alone
+        // does not, which would leave the player stuck in combat after the fight ends.
+        me->CombatStop(true);
         me->GetMotionMaster()->Clear();
         if (_owner)
             me->GetMotionMaster()->MoveFollow(_owner, GetFollowDist(), GetFollowAngle());
