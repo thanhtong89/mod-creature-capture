@@ -1117,6 +1117,17 @@ public:
     }
 
 private:
+    // Enemies this guardian is in PvE combat with. Player-summoned guardians have no
+    // threat list of their own, so combat references are the source of truth.
+    std::vector<Unit*> GetCombatEnemies() const
+    {
+        std::vector<Unit*> enemies;
+        for (auto const& [guid, ref] : me->GetCombatManager().GetPvECombatRefs())
+            if (Unit* enemy = ref->GetOther(me))
+                enemies.push_back(enemy);
+        return enemies;
+    }
+
     // Check if the target has established threat from the owner or any friendly combatant.
     // Only called on targets already known to be owner-related, so just verify
     // someone is actively tanking (has meaningful threat on the target's threat list).
@@ -1125,13 +1136,13 @@ private:
         if (!target || !target->IsCreature())
             return false;
 
-        auto const& threatList = target->ToCreature()->GetThreatMgr().GetThreatList();
-        if (threatList.empty())
+        ThreatManager const& threatMgr = target->GetThreatMgr();
+        if (threatMgr.IsThreatListEmpty())
             return false;
 
         // Top threat holder has established aggro — healer is safe to assist
-        HostileReference* topRef = threatList.front();
-        return topRef && topRef->getTarget() && topRef->getTarget() != me &&
+        ThreatReference const* topRef = *threatMgr.GetSortedThreatList().begin();
+        return topRef && topRef->GetVictim() && topRef->GetVictim() != me &&
                topRef->GetThreat() > 0.0f;
     }
 
@@ -1493,12 +1504,8 @@ private:
             // For every enemy on our threat list, check if it's attacking an ally
             // and inject threat to pull it off them
             Unit* tauntTarget = nullptr;
-            for (auto const& ref : me->GetThreatMgr().GetThreatList())
+            for (Unit* enemy : GetCombatEnemies())
             {
-                Unit* enemy = ref->getTarget();
-                if (!enemy)
-                    continue;
-
                 Unit* enemyVictim = enemy->GetVictim();
                 if (!enemyVictim || enemyVictim == me)
                     continue;
@@ -1508,7 +1515,8 @@ private:
                     if (enemyVictim->GetGUID() == allyGuid)
                     {
                         // Inject enough threat to overtake the current top holder
-                        me->AddThreat(enemy, 100.0f);
+                        if (enemy->CanHaveThreatList())
+                            enemy->GetThreatMgr().AddThreat(me, 100.0f);
 
                         // Remember the first enemy attacking an ally for taunt
                         if (!tauntTarget)
@@ -1523,8 +1531,9 @@ private:
             if (tauntTarget && !_hasTauntSpell && _tauntTimer <= 0 &&
                 tauntTarget->IsCreature() && tauntTarget->CanHaveThreatList())
             {
-                tauntTarget->TauntApply(me);
-                me->AddThreat(tauntTarget, 500.0f);
+                ThreatManager& tauntMgr = tauntTarget->GetThreatMgr();
+                tauntMgr.MatchUnitThreatToHighestThreat(me);
+                tauntMgr.AddThreat(me, 500.0f);
                 _tauntTimer = 8000;
 
                 // Switch to attacking the taunted target
@@ -2168,10 +2177,9 @@ private:
             return false;
         };
 
-        for (auto const& ref : me->GetThreatMgr().GetThreatList())
+        for (Unit* enemy : GetCombatEnemies())
         {
-            Unit* enemy = ref->getTarget();
-            if (!enemy || !enemy->IsAlive())
+            if (!enemy->IsAlive())
                 continue;
             if (maxRange > 0.0f && !me->IsWithinDist(enemy, maxRange))
                 continue;
